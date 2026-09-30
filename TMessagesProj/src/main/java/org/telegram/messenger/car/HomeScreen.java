@@ -66,7 +66,7 @@ public class HomeScreen extends Screen
 
     private static final int MAX_CONVERSATIONS = 6;
     private static final int MAX_MESSAGES_PER_CONV = 5;
-    private static final int MAX_MUSIC_DIALOGS = 50;
+    private static final int MAX_AUDIO_DIALOGS = 50;
 
     private final long sessionStartMillis;
     private int currentAccount;
@@ -127,7 +127,7 @@ public class HomeScreen extends Screen
         builder.addTab(new Tab.Builder()
                 .setContentId(TAB_MUSIC)
                 .setIcon(iconResource(R.drawable.filled_widget_music))
-                .setTitle(LocaleController.getString(R.string.Music))
+                .setTitle(LocaleController.getString(R.string.CarAudio))
                 .build());
 
         builder.setActiveTabContentId(activeTabId);
@@ -290,17 +290,17 @@ public class HomeScreen extends Screen
             }
             return new ListTemplate.Builder().setLoading(true).build();
         }
-        ArrayList<Long> dialogs = session.getMusicDialogsSortedByVisibleOrder();
+        ArrayList<Long> dialogs = session.getAudioDialogsSortedByVisibleOrder();
         if (dialogs == null || dialogs.isEmpty()) {
-            return new MessageTemplate.Builder(LocaleController.getString(R.string.NoCarMusic))
+            return new MessageTemplate.Builder(LocaleController.getString(R.string.NoAudioFiles))
                     .build();
         }
         ItemList.Builder list = new ItemList.Builder();
         int added = 0;
-        for (int i = 0; i < dialogs.size() && added < MAX_MUSIC_DIALOGS; i++) {
+        for (int i = 0; i < dialogs.size() && added < MAX_AUDIO_DIALOGS; i++) {
             long dialogId = dialogs.get(i);
-            ArrayList<MessageObject> messages = session.getMusicMessages(dialogId);
-            if (messages == null || messages.isEmpty()) continue;
+            int audioCount = session.getAudioMessageCount(dialogId);
+            if (audioCount == 0) continue;
             String title;
             TLRPC.FileLocation avatarLoc = null;
             if (DialogObject.isUserDialog(dialogId)) {
@@ -326,7 +326,7 @@ public class HomeScreen extends Screen
 
             Row.Builder row = new Row.Builder()
                     .setTitle(title)
-                    .addText(LocaleController.formatPluralString("MusicFiles", messages.size()))
+                    .addText(LocaleController.formatPluralString("AudioFiles", audioCount))
                     .setBrowsable(true)
                     .setOnClickListener(() -> getScreenManager().push(new MusicSongsScreen(getCarContext(), dialogId, title)));
 
@@ -338,6 +338,14 @@ public class HomeScreen extends Screen
             }
             list.addItem(row.build());
             added++;
+        }
+        if (dialogs.size() > MAX_AUDIO_DIALOGS) {
+            list.addItem(new Row.Builder()
+                    .setTitle(LocaleController.getString(R.string.MoreAudioChats))
+                    .setBrowsable(true)
+                    .setOnClickListener(() -> getScreenManager().push(
+                            new AudioChatsScreen(getCarContext(), MAX_AUDIO_DIALOGS)))
+                    .build());
         }
         return new ListTemplate.Builder()
                 .setSingleList(list.build())
