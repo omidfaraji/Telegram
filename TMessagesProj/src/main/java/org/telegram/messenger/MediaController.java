@@ -1041,8 +1041,12 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
         return messageObject.getDialogId() + "_" + messageObject.getId();
     }
 
+    // Voice and video queue started from Android Auto; follows the shuffle and repeat settings.
+    private ArrayList<MessageObject> carVoiceQueue;
+
     public void setAudioOnlyVideos(ArrayList<MessageObject> messageObjects) {
         audioOnlyVideoKeys.clear();
+        carVoiceQueue = messageObjects != null && !messageObjects.isEmpty() ? new ArrayList<>(messageObjects) : null;
         if (messageObjects == null) {
             return;
         }
@@ -1051,6 +1055,54 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
                 audioOnlyVideoKeys.add(audioOnlyKey(messageObject));
             }
         }
+    }
+
+    private int indexInCarVoiceQueue(MessageObject messageObject) {
+        if (carVoiceQueue == null || messageObject == null) {
+            return -1;
+        }
+        for (int a = 0; a < carVoiceQueue.size(); a++) {
+            MessageObject item = carVoiceQueue.get(a);
+            if (item.getDialogId() == messageObject.getDialogId() && item.getId() == messageObject.getId()) {
+                return a;
+            }
+        }
+        return -1;
+    }
+
+    public boolean isInCarVoiceQueue(MessageObject messageObject) {
+        return indexInCarVoiceQueue(messageObject) >= 0;
+    }
+
+    /**
+     * Next item of the Android Auto voice and video queue, honoring shuffle and repeat.
+     * Returns null when playback should stop.
+     */
+    public MessageObject getCarVoiceQueueNext(MessageObject current, int direction, boolean byEnd) {
+        int index = indexInCarVoiceQueue(current);
+        if (index < 0) {
+            return null;
+        }
+        int size = carVoiceQueue.size();
+        if (byEnd && SharedConfig.repeatMode == 2) {
+            return carVoiceQueue.get(index);
+        }
+        if (SharedConfig.shuffleMusic && size > 1) {
+            int next = Utilities.random.nextInt(size - 1);
+            return carVoiceQueue.get(next >= index ? next + 1 : next);
+        }
+        int next = index + direction;
+        if (next < 0 || next >= size) {
+            if (byEnd && SharedConfig.repeatMode == 0) {
+                return null;
+            }
+            next = (next + size) % size;
+        }
+        return carVoiceQueue.get(next);
+    }
+
+    public void setForceLoopCurrentPlaylist(boolean value) {
+        forceLoopCurrentPlaylist = value;
     }
 
     public boolean isAudioOnlyVideo(MessageObject messageObject) {
@@ -2580,7 +2632,15 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
                 NotificationsController.audioManager.abandonAudioFocus(this);
                 hasAudioFocus = 0;
                 int index = -1;
-                if (voiceMessagesPlaylist != null) {
+                MessageObject carNext = null;
+                if (byVoiceEnd && isInCarVoiceQueue(lastFile)) {
+                    carNext = getCarVoiceQueueNext(lastFile, 1, true);
+                    if (carNext == null) {
+                        voiceMessagesPlaylist = null;
+                        voiceMessagesPlaylistMap = null;
+                    }
+                }
+                if (carNext == null && voiceMessagesPlaylist != null) {
                     if (byVoiceEnd && (index = voiceMessagesPlaylist.indexOf(lastFile)) >= 0) {
                         voiceMessagesPlaylist.remove(index);
                         voiceMessagesPlaylistMap.remove(lastFile.getId());
@@ -2593,7 +2653,11 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
                         voiceMessagesPlaylistMap = null;
                     }
                 }
-                if (voiceMessagesPlaylist != null && index < voiceMessagesPlaylist.size()) {
+                if (carNext != null) {
+                    carNext.resetPlayingProgress();
+                    playMessage(carNext);
+                    playingNext = true;
+                } else if (voiceMessagesPlaylist != null && index < voiceMessagesPlaylist.size()) {
                     MessageObject nextVoiceMessage = voiceMessagesPlaylist.get(index);
                     playMessage(nextVoiceMessage);
                     playingNext = true;
@@ -3658,6 +3722,9 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
         checkVolumeBarUI();
         if (!audioOnlyVideoKeys.isEmpty() && !audioOnlyVideoKeys.contains(audioOnlyKey(messageObject))) {
             audioOnlyVideoKeys.clear();
+        }
+        if (carVoiceQueue != null && !isInCarVoiceQueue(messageObject)) {
+            carVoiceQueue = null;
         }
         final boolean audioOnly = isAudioOnlyVideo(messageObject);
         if ((audioPlayer != null || videoPlayer != null) && isSamePlayingMessage(messageObject)) {

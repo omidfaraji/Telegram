@@ -24,6 +24,7 @@ import android.support.v4.media.session.PlaybackStateCompat;
 import android.text.TextUtils;
 import android.util.LruCache;
 
+import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.collection.LongSparseArray;
 
@@ -36,6 +37,7 @@ import org.telegram.ui.LaunchActivity;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -71,8 +73,55 @@ public class TelegramMediaSession {
         lastPlayerMetadata = metadata;
         TelegramMediaSession current = instance;
         if (current != null) {
-            current.session.setMetadata(metadata);
+            current.session.setMetadata(current.withCoverArt(metadata));
         }
+    }
+
+    /** Adds the Telegram cover thumbnail when the audio file has no embedded album art. */
+    private MediaMetadataCompat withCoverArt(MediaMetadataCompat metadata) {
+        if (metadata == null || metadata.getBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART) != null) {
+            return metadata;
+        }
+        MessageObject playing = MediaController.getInstance().getPlayingMessageObject();
+        Bitmap cover = playing != null ? getNowPlayingCover(playing) : null;
+        MediaMetadataCompat.Builder builder = new MediaMetadataCompat.Builder(metadata);
+        if (cover == null) {
+            boolean video = playing != null && isCarVideo(playing);
+            cover = getFallbackCover(video);
+            String uri = getFallbackCoverUri(video).toString();
+            builder.putString(MediaMetadataCompat.METADATA_KEY_ALBUM_ART_URI, uri)
+                    .putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON_URI, uri);
+        }
+        if (cover != null) {
+            builder.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, cover);
+        }
+        return builder.build();
+    }
+
+    private static final int FALLBACK_COVER_SIZE_PX = 320;
+    private final Bitmap[] fallbackCovers = new Bitmap[2];
+
+    /** High resolution placeholder art for audio without a cover photo. */
+    private Uri getFallbackCoverUri(boolean video) {
+        return Uri.parse("android.resource://" + appContext.getPackageName() + "/drawable/"
+                + (video ? "car_video_cover" : "car_audio_cover"));
+    }
+
+    @Nullable
+    private Bitmap getFallbackCover(boolean video) {
+        int index = video ? 1 : 0;
+        if (fallbackCovers[index] == null) {
+            try {
+                Bitmap decoded = BitmapFactory.decodeResource(appContext.getResources(),
+                        video ? R.drawable.car_video_cover : R.drawable.car_audio_cover);
+                if (decoded != null) {
+                    fallbackCovers[index] = cropAndScale(decoded, FALLBACK_COVER_SIZE_PX, true);
+                }
+            } catch (Throwable e) {
+                FileLog.e(e);
+            }
+        }
+        return fallbackCovers[index];
     }
 
     public static void mirrorPlayerState(PlaybackStateCompat state) {
@@ -103,6 +152,12 @@ public class TelegramMediaSession {
     private static final String SLOT_RESERVATION_SKIP_TO_PREV = "com.google.android.gms.car.media.ALWAYS_RESERVE_SPACE_FOR.ACTION_SKIP_TO_PREVIOUS";
     private static final String SLOT_RESERVATION_QUEUE = "com.google.android.gms.car.media.ALWAYS_RESERVE_SPACE_FOR.ACTION_QUEUE";
 
+    private static final String SEARCH_SUPPORTED = "android.media.browse.SEARCH_SUPPORTED";
+    // Android Auto shows browsable root children as tabs: one for audio chats, one for video chats.
+    private static final String MEDIA_ID_LIBRARY = "__LIBRARY__";
+    private static final String MEDIA_ID_VIDEO_LIBRARY = "__VIDEOS__";
+    private static final String MEDIA_ID_VIDEO_CHAT_PREFIX = "__VCHAT_";
+    private static final String MEDIA_ID_MESSAGE_PREFIX = "msg_";
     private static final String CONTENT_STYLE_SUPPORTED = "android.media.browse.CONTENT_STYLE_SUPPORTED";
     private static final String CONTENT_STYLE_BROWSABLE_HINT = "android.media.browse.CONTENT_STYLE_BROWSABLE_HINT";
     private static final String CONTENT_STYLE_PLAYABLE_HINT = "android.media.browse.CONTENT_STYLE_PLAYABLE_HINT";
@@ -120,6 +175,7 @@ public class TelegramMediaSession {
     private int audioCatalogRevision;
     private final ArrayList<Runnable> pendingCatalogCallbacks = new ArrayList<>();
     private final ArrayList<Long> dialogs = new ArrayList<>();
+    private final ArrayList<Long> videoDialogs = new ArrayList<>();
     private final LongSparseArray<TLRPC.User> users = new LongSparseArray<>();
     private final LongSparseArray<TLRPC.Chat> chats = new LongSparseArray<>();
     private final LongSparseArray<ArrayList<MessageObject>> audioObjects = new LongSparseArray<>();
@@ -177,6 +233,7 @@ public class TelegramMediaSession {
 
     private void onAccountSwitched() {
         currentAccount = UserConfig.selectedAccount;
+        updateMessageObservers();
         audioCatalogRevision++;
         lastSelectedDialog = AndroidUtilities.getPrefIntOrLong(
                 MessagesController.getNotificationsSettings(currentAccount), "auto_lastSelectedDialog", 0);
@@ -184,6 +241,7 @@ public class TelegramMediaSession {
         loadingChats = false;
         pendingCatalogCallbacks.clear();
         dialogs.clear();
+        videoDialogs.clear();
         users.clear();
         chats.clear();
         audioObjects.clear();
@@ -220,6 +278,15 @@ public class TelegramMediaSession {
         return sorted;
     }
 
+    // Kept for the unregistered upstream Car App screens.
+    public ArrayList<Long> getMusicDialogsSortedByVisibleOrder() {
+        return getAudioDialogsSortedByVisibleOrder();
+    }
+
+    public ArrayList<MessageObject> getMusicMessages(long dialogId) {
+        return getAudioMessages(dialogId);
+    }
+
     public MediaSessionCompat getSession() {
         return session;
     }
@@ -240,8 +307,9 @@ public class TelegramMediaSession {
 
     public Bundle buildRootHints() {
         Bundle rootExtras = new Bundle();
+        rootExtras.putBoolean(SEARCH_SUPPORTED, true);
         rootExtras.putBoolean(CONTENT_STYLE_SUPPORTED, true);
-        rootExtras.putInt(CONTENT_STYLE_BROWSABLE_HINT, CONTENT_STYLE_GRID_ITEM_HINT_VALUE);
+        rootExtras.putInt(CONTENT_STYLE_BROWSABLE_HINT, CONTENT_STYLE_LIST_ITEM_HINT_VALUE);
         rootExtras.putInt(CONTENT_STYLE_PLAYABLE_HINT, CONTENT_STYLE_LIST_ITEM_HINT_VALUE);
         return rootExtras;
     }
@@ -265,6 +333,218 @@ public class TelegramMediaSession {
 
     public ArrayList<Long> getAudioDialogs() {
         return dialogs;
+    }
+
+    /** Chat name as shown in Telegram's chat list, including Saved Messages and Replies. */
+    @NonNull
+    public String getDialogTitle(long dialogId) {
+        if (DialogObject.isUserDialog(dialogId)) {
+            if (dialogId == UserConfig.getInstance(currentAccount).getClientUserId()) {
+                return LocaleController.getString(R.string.SavedMessages);
+            }
+            if (UserObject.isReplyUser(dialogId)) {
+                return LocaleController.getString(R.string.RepliesTitle);
+            }
+            TLRPC.User user = MessagesController.getInstance(currentAccount).getUser(dialogId);
+            if (user == null) {
+                user = users.get(dialogId);
+            }
+            if (UserObject.isUserSelf(user)) {
+                return LocaleController.getString(R.string.SavedMessages);
+            }
+            return UserObject.getUserName(user);
+        }
+        TLRPC.Chat chat = MessagesController.getInstance(currentAccount).getChat(-dialogId);
+        if (chat == null) {
+            chat = chats.get(-dialogId);
+        }
+        return chat != null && !TextUtils.isEmpty(chat.title) ? chat.title : LocaleController.getString(R.string.HiddenName);
+    }
+
+    /** Lightweight search entry so global search does not keep every MessageObject in memory. */
+    public static final class AudioSearchResult {
+        public final long dialogId;
+        public final int messageId;
+        public final String title;
+        public final String author;
+        @Nullable
+        public final String videoLabel;
+        final String searchText;
+
+        AudioSearchResult(long dialogId, int messageId, String title, String author, @Nullable String videoLabel) {
+            this.dialogId = dialogId;
+            this.messageId = messageId;
+            this.title = title != null ? title : "";
+            this.author = author != null ? author : "";
+            this.videoLabel = videoLabel;
+            this.searchText = (this.title + "\n" + this.author).toLowerCase(Locale.ROOT);
+        }
+    }
+
+    public interface AudioSearchCallback {
+        void onResults(ArrayList<AudioSearchResult> results);
+    }
+
+    private static final int MAX_SEARCH_RESULTS = 100;
+    @Nullable
+    private ArrayList<AudioSearchResult> searchIndex;
+    private int searchIndexRevision = -1;
+    private boolean buildingSearchIndex;
+    private final ArrayList<Runnable> pendingSearchIndexCallbacks = new ArrayList<>();
+
+    public static boolean matchesQuery(@Nullable String text, @NonNull String normalizedQuery) {
+        return normalizedQuery.isEmpty() || text != null && text.toLowerCase(Locale.ROOT).contains(normalizedQuery);
+    }
+
+    public static String normalizeQuery(@Nullable String query) {
+        return query == null ? "" : query.trim().toLowerCase(Locale.ROOT);
+    }
+
+    /** Searches audio in one chat when dialogId is not 0, otherwise across all chats. */
+    public void searchAudio(long dialogId, @Nullable String query, AudioSearchCallback callback) {
+        String normalized = normalizeQuery(query);
+        if (dialogId != 0) {
+            loadAudioMessages(dialogId, () -> {
+                ArrayList<AudioSearchResult> results = new ArrayList<>();
+                ArrayList<MessageObject> messages = audioObjects.get(dialogId);
+                if (messages != null && !normalized.isEmpty()) {
+                    for (MessageObject message : messages) {
+                        AudioSearchResult result = toSearchResult(message);
+                        if (result.searchText.contains(normalized)) {
+                            results.add(result);
+                            if (results.size() >= MAX_SEARCH_RESULTS) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                callback.onResults(results);
+            });
+            return;
+        }
+        ensureSearchIndex(() -> {
+            ArrayList<AudioSearchResult> results = new ArrayList<>();
+            if (searchIndex != null && !normalized.isEmpty()) {
+                for (AudioSearchResult entry : searchIndex) {
+                    if (entry.searchText.contains(normalized)) {
+                        results.add(entry);
+                        if (results.size() >= MAX_SEARCH_RESULTS) {
+                            break;
+                        }
+                    }
+                }
+            }
+            callback.onResults(results);
+        });
+    }
+
+    private static AudioSearchResult toSearchResult(MessageObject message) {
+        return new AudioSearchResult(message.getDialogId(), message.getId(), getAudioTitle(message),
+                message.getMusicAuthor(), getVideoLabel(message));
+    }
+
+    private void ensureSearchIndex(Runnable onReady) {
+        if (searchIndex != null && searchIndexRevision == audioCatalogRevision) {
+            AndroidUtilities.runOnUIThread(onReady);
+            return;
+        }
+        pendingSearchIndexCallbacks.add(onReady);
+        if (buildingSearchIndex) {
+            return;
+        }
+        buildingSearchIndex = true;
+        final int account = currentAccount;
+        final int revision = audioCatalogRevision;
+        MessagesStorage messagesStorage = MessagesStorage.getInstance(account);
+        messagesStorage.getStorageQueue().postRunnable(() -> {
+            ArrayList<AudioSearchResult> entries = new ArrayList<>();
+            try {
+                String types = String.format(Locale.US, "%d, %d, %d", MediaDataController.MEDIA_AUDIO, MediaDataController.MEDIA_MUSIC, MediaDataController.MEDIA_PHOTOVIDEO);
+                SQLiteCursor cursor = messagesStorage.getDatabase().queryFinalized("SELECT data, mid, uid FROM media_v4 WHERE uid != 0 AND mid > 0 AND type IN (" + types + ") ORDER BY date DESC, mid DESC");
+                while (cursor.next()) {
+                    long did = cursor.longValue(2);
+                    if (DialogObject.isEncryptedDialog(did)) {
+                        continue;
+                    }
+                    NativeByteBuffer data = cursor.byteBufferValue(0);
+                    if (data == null) {
+                        continue;
+                    }
+                    TLRPC.Message message = TLRPC.Message.TLdeserialize(data, data.readInt32(false), false);
+                    if (message == null) {
+                        data.reuse();
+                        continue;
+                    }
+                    message.readAttachPath(data, UserConfig.getInstance(account).clientUserId);
+                    data.reuse();
+                    if (message.media instanceof TLRPC.TL_messageMediaPhoto) {
+                        continue;
+                    }
+                    message.id = cursor.intValue(1);
+                    message.dialog_id = did;
+                    MessageObject messageObject = new MessageObject(account, message, false, false);
+                    if (isCarPlayable(messageObject)) {
+                        entries.add(toSearchResult(messageObject));
+                    }
+                }
+                cursor.dispose();
+            } catch (Exception e) {
+                FileLog.e(e);
+            }
+            AndroidUtilities.runOnUIThread(() -> {
+                buildingSearchIndex = false;
+                if (account == currentAccount) {
+                    searchIndex = entries;
+                    searchIndexRevision = revision;
+                }
+                ArrayList<Runnable> callbacks = new ArrayList<>(pendingSearchIndexCallbacks);
+                pendingSearchIndexCallbacks.clear();
+                for (Runnable callback : callbacks) {
+                    callback.run();
+                }
+            });
+        });
+    }
+
+    /** Plays a message by id, loading its chat audio first when needed. */
+    public void playAudioMessage(long dialogId, int messageId) {
+        loadAudioMessages(dialogId, () -> {
+            ArrayList<MessageObject> messages = audioObjects.get(dialogId);
+            if (messages == null) {
+                return;
+            }
+            for (int i = 0; i < messages.size(); i++) {
+                if (messages.get(i).getId() == messageId) {
+                    playAudio(dialogId, i);
+                    return;
+                }
+            }
+        });
+    }
+
+    public void togglePlayPause() {
+        MediaController controller = MediaController.getInstance();
+        MessageObject playing = controller.getPlayingMessageObject();
+        if (playing == null) {
+            session.getController().getTransportControls().play();
+        } else if (controller.isMessagePaused()) {
+            controller.playMessage(playing);
+        } else {
+            controller.pauseMessage(playing);
+        }
+    }
+
+    public void skipToNext() {
+        skipToAdjacentAudio(1);
+    }
+
+    public void skipToPrevious() {
+        MessageObject playing = MediaController.getInstance().getPlayingMessageObject();
+        if (playing != null && playing.audioProgressSec > 3) {
+            MediaController.getInstance().seekToProgress(playing, 0);
+            return;
+        }
+        skipToAdjacentAudio(-1);
     }
 
     public TLRPC.User getMusicUser(long userId) {
@@ -303,6 +583,7 @@ public class TelegramMediaSession {
             audioCatalogRevision++;
             chatsLoaded = false;
             dialogs.clear();
+            videoDialogs.clear();
             users.clear();
             chats.clear();
             audioObjects.clear();
@@ -329,21 +610,62 @@ public class TelegramMediaSession {
         return false;
     }
 
-    private static final String PREF_SHOW_VIDEOS = "car_show_videos";
-
-    public static boolean isShowVideosEnabled() {
-        return MessagesController.getGlobalMainSettings().getBoolean(PREF_SHOW_VIDEOS, false);
+    public interface BrowseTreeListener {
+        void onChildrenChanged(String parentMediaId);
     }
 
-    public void setShowVideosEnabled(boolean enabled, Runnable onLoaded) {
-        if (enabled == isShowVideosEnabled()) {
-            if (onLoaded != null) {
-                AndroidUtilities.runOnUIThread(onLoaded);
+    @Nullable
+    private static BrowseTreeListener browseTreeListener;
+    private int observedAccount = -1;
+    private final NotificationCenter.NotificationCenterDelegate messageObserver = (id, account, args) -> {
+        if (id == NotificationCenter.didReceiveNewMessages) {
+            if (args.length > 1 && args[0] instanceof Long && args[1] instanceof ArrayList
+                    && (args.length <= 2 || !Boolean.TRUE.equals(args[2]))) {
+                @SuppressWarnings("unchecked")
+                ArrayList<MessageObject> messages = (ArrayList<MessageObject>) args[1];
+                if (hasPlayableAudio(messages)) {
+                    long dialogId = (Long) args[0];
+                    refreshAudioData(dialogId, () -> {
+                        notifyBrowseTree(MEDIA_ID_CHAT_PREFIX + dialogId);
+                        notifyBrowseTree(MEDIA_ID_VIDEO_CHAT_PREFIX + dialogId);
+                    });
+                }
             }
+        } else {
+            refreshAudioCatalog(null);
+        }
+    };
+
+    /** Registers the connected media browser so the audio tree refreshes as messages change. */
+    public void setBrowseTreeListener(@Nullable BrowseTreeListener listener) {
+        browseTreeListener = listener;
+        updateMessageObservers();
+    }
+
+    private void updateMessageObservers() {
+        int target = browseTreeListener != null ? currentAccount : -1;
+        if (target == observedAccount) {
             return;
         }
-        MessagesController.getGlobalMainSettings().edit().putBoolean(PREF_SHOW_VIDEOS, enabled).apply();
-        refreshAudioCatalog(onLoaded);
+        int[] events = {NotificationCenter.didReceiveNewMessages, NotificationCenter.messagesDeleted, NotificationCenter.historyCleared};
+        if (observedAccount >= 0) {
+            for (int event : events) {
+                NotificationCenter.getInstance(observedAccount).removeObserver(messageObserver, event);
+            }
+        }
+        observedAccount = target;
+        if (target >= 0) {
+            for (int event : events) {
+                NotificationCenter.getInstance(target).addObserver(messageObserver, event);
+            }
+        }
+    }
+
+    private static void notifyBrowseTree(String parentMediaId) {
+        BrowseTreeListener listener = browseTreeListener;
+        if (listener != null) {
+            listener.onChildrenChanged(parentMediaId);
+        }
     }
 
     public static boolean isCarPlayable(MessageObject messageObject) {
@@ -356,9 +678,6 @@ public class TelegramMediaSession {
         if (messageObject.isVoice()) {
             return !messageObject.isVoiceOnce();
         }
-        if (!isShowVideosEnabled()) {
-            return false;
-        }
         if (messageObject.isRoundVideo()) {
             return !messageObject.isRoundOnce() && !messageObject.needDrawBluredPreview();
         }
@@ -366,6 +685,10 @@ public class TelegramMediaSession {
             return !messageObject.needDrawBluredPreview() && !messageObject.isSecretMedia();
         }
         return false;
+    }
+
+    private static int getCarKind(MessageObject messageObject) {
+        return messageObject.isMusic() ? 0 : isCarVideo(messageObject) ? 2 : 1;
     }
 
     public static boolean isCarVideo(MessageObject messageObject) {
@@ -450,6 +773,30 @@ public class TelegramMediaSession {
         callback.onResult(loadChildrenSync(parentMediaId));
     }
 
+    /** Orders chats like Telegram's chat list: pinned chats first, then by last message date. */
+    private static void sortByChatListOrder(MessagesStorage messagesStorage, ArrayList<Long> dialogIds) {
+        if (dialogIds.size() < 2) {
+            return;
+        }
+        HashMap<Long, Integer> order = new HashMap<>();
+        try {
+            SQLiteCursor cursor = messagesStorage.getDatabase().queryFinalized(String.format(Locale.US,
+                    "SELECT did FROM dialogs WHERE did IN (%s) ORDER BY pinned DESC, date DESC", TextUtils.join(",", dialogIds)));
+            while (cursor.next()) {
+                order.put(cursor.longValue(0), order.size());
+            }
+            cursor.dispose();
+        } catch (Exception e) {
+            FileLog.e(e);
+            return;
+        }
+        Collections.sort(dialogIds, (a, b) -> {
+            Integer oa = order.get(a);
+            Integer ob = order.get(b);
+            return Integer.compare(oa != null ? oa : Integer.MAX_VALUE, ob != null ? ob : Integer.MAX_VALUE);
+        });
+    }
+
     private void loadChats() {
         if (loadingChats) {
             return;
@@ -461,6 +808,8 @@ public class TelegramMediaSession {
         MessagesStorage messagesStorage = MessagesStorage.getInstance(account);
         messagesStorage.getStorageQueue().postRunnable(() -> {
             ArrayList<Long> loadedDialogs = new ArrayList<>();
+            ArrayList<Long> loadedVideoDialogs = new ArrayList<>();
+            Set<Long> loadedVideoDialogIds = new HashSet<>();
             Set<Long> loadedDialogIds = new HashSet<>();
             LongSparseArray<Integer> loadedAudioCounts = new LongSparseArray<>();
             LongSparseArray<TLRPC.User> loadedUsers = new LongSparseArray<>();
@@ -516,11 +865,26 @@ public class TelegramMediaSession {
                     if (!isCarPlayable(messageObject)) {
                         continue;
                     }
+                    if (isCarVideo(messageObject)) {
+                        if (loadedVideoDialogIds.add(dialogId)) {
+                            loadedVideoDialogs.add(dialogId);
+                            if (!loadedDialogIds.contains(dialogId)) {
+                                if (DialogObject.isUserDialog(dialogId)) {
+                                    usersToLoad.add(dialogId);
+                                } else {
+                                    chatsToLoad.add(-dialogId);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     Integer voiceCount = voiceCounts.get(dialogId);
                     voiceCounts.put(dialogId, voiceCount == null ? 1 : voiceCount + 1);
                     if (loadedDialogIds.add(dialogId)) {
                         loadedDialogs.add(dialogId);
-                        if (DialogObject.isUserDialog(dialogId)) {
+                        if (loadedVideoDialogIds.contains(dialogId)) {
+                            // Already queued for loading by a video in the same chat.
+                        } else if (DialogObject.isUserDialog(dialogId)) {
                             usersToLoad.add(dialogId);
                         } else {
                             chatsToLoad.add(-dialogId);
@@ -533,6 +897,9 @@ public class TelegramMediaSession {
                     Integer musicCount = loadedAudioCounts.get(dialogId);
                     loadedAudioCounts.put(dialogId, (musicCount != null ? musicCount : 0) + voiceCounts.valueAt(i));
                 }
+
+                sortByChatListOrder(messagesStorage, loadedDialogs);
+                sortByChatListOrder(messagesStorage, loadedVideoDialogs);
 
                 if (!usersToLoad.isEmpty()) {
                     ArrayList<TLRPC.User> usersArrayList = new ArrayList<>();
@@ -563,6 +930,8 @@ public class TelegramMediaSession {
                 }
                 dialogs.clear();
                 dialogs.addAll(loadedDialogs);
+                videoDialogs.clear();
+                videoDialogs.addAll(loadedVideoDialogs);
                 audioCounts.clear();
                 for (int i = 0; i < loadedAudioCounts.size(); i++) {
                     audioCounts.put(loadedAudioCounts.keyAt(i), loadedAudioCounts.valueAt(i));
@@ -577,6 +946,8 @@ public class TelegramMediaSession {
                 }
                 chatsLoaded = true;
                 loadingChats = false;
+                notifyBrowseTree(MEDIA_ID_LIBRARY);
+                notifyBrowseTree(MEDIA_ID_VIDEO_LIBRARY);
                 if (lastSelectedDialog == 0 && !dialogs.isEmpty()) {
                     lastSelectedDialog = dialogs.get(0);
                 }
@@ -642,7 +1013,14 @@ public class TelegramMediaSession {
                     arrayList.add(messageObject);
                 }
                 cursor.dispose();
-                Collections.reverse(arrayList);
+                // Alphabetical order lets Android Auto group items by letter and show its A-Z jump.
+                final java.text.Collator collator = java.text.Collator.getInstance();
+                collator.setStrength(java.text.Collator.PRIMARY);
+                Collections.sort(arrayList, (a, b) -> {
+                    String ta = getAudioTitle(a);
+                    String tb = getAudioTitle(b);
+                    return collator.compare(ta != null ? ta.trim() : "", tb != null ? tb.trim() : "");
+                });
                 for (int i = 0; i < arrayList.size(); i++) {
                     MessageObject messageObject = arrayList.get(i);
                     MediaDescriptionCompat description = new MediaDescriptionCompat.Builder()
@@ -694,13 +1072,14 @@ public class TelegramMediaSession {
 
         ArrayList<MessageObject> playlist = new ArrayList<>();
         for (MessageObject message : messages) {
-            if (selected.isMusic() == message.isMusic()) {
+            if (getCarKind(selected) == getCarKind(message)) {
                 playlist.add(message);
             }
         }
         if (selected.isMusic()) {
             controller.setAudioOnlyVideos(null);
             controller.setPlaylist(playlist, selected, 0, false, null);
+            controller.setForceLoopCurrentPlaylist(false);
         } else if (selected.isVoice() || isCarVideo(selected)) {
             // Voice messages and videos share one queue; videos play as audio only.
             controller.setAudioOnlyVideos(playlist);
@@ -714,15 +1093,7 @@ public class TelegramMediaSession {
         if (queue != null) {
             session.setQueue(queue);
         }
-        if (DialogObject.isUserDialog(dialogId)) {
-            TLRPC.User user = users.get(dialogId);
-            session.setQueueTitle(user != null
-                    ? ContactsController.formatName(user.first_name, user.last_name)
-                    : "DELETED USER");
-        } else {
-            TLRPC.Chat chat = chats.get(-dialogId);
-            session.setQueueTitle(chat != null ? chat.title : "DELETED CHAT");
-        }
+        session.setQueueTitle(getDialogTitle(dialogId));
     }
 
     private void skipToAdjacentAudio(int direction) {
@@ -730,9 +1101,18 @@ public class TelegramMediaSession {
         if (playing == null) {
             return;
         }
+        MediaController controller = MediaController.getInstance();
+        if (controller.isInCarVoiceQueue(playing)) {
+            MessageObject next = controller.getCarVoiceQueueNext(playing, direction, false);
+            if (next != null) {
+                next.resetPlayingProgress();
+                controller.playMessage(next);
+            }
+            return;
+        }
         ArrayList<MessageObject> messages = audioObjects.get(playing.getDialogId());
         int index = messages != null ? messages.indexOf(playing) : -1;
-        if (index < 0) {
+        if (index < 0 || SharedConfig.shuffleMusic && playing.isMusic()) {
             if (direction > 0) {
                 MediaController.getInstance().playNextMessage();
             } else {
@@ -745,11 +1125,16 @@ public class TelegramMediaSession {
     }
 
     private long getDialogIdFromMediaId(String parentMediaId) {
-        if (parentMediaId == null || !parentMediaId.startsWith(MEDIA_ID_CHAT_PREFIX)) {
+        String prefix;
+        if (parentMediaId != null && parentMediaId.startsWith(MEDIA_ID_CHAT_PREFIX)) {
+            prefix = MEDIA_ID_CHAT_PREFIX;
+        } else if (parentMediaId != null && parentMediaId.startsWith(MEDIA_ID_VIDEO_CHAT_PREFIX)) {
+            prefix = MEDIA_ID_VIDEO_CHAT_PREFIX;
+        } else {
             return 0;
         }
         try {
-            return Long.parseLong(parentMediaId.substring(MEDIA_ID_CHAT_PREFIX.length()));
+            return Long.parseLong(parentMediaId.substring(prefix.length()));
         } catch (Exception e) {
             FileLog.e(e);
             return 0;
@@ -759,72 +1144,179 @@ public class TelegramMediaSession {
     private List<MediaBrowser.MediaItem> loadChildrenSync(String parentMediaId) {
         List<MediaBrowser.MediaItem> mediaItems = new ArrayList<>();
         if (MEDIA_ID_ROOT.equals(parentMediaId)) {
+            mediaItems.add(new MediaBrowser.MediaItem(new android.media.MediaDescription.Builder()
+                    .setMediaId(MEDIA_ID_LIBRARY)
+                    .setTitle(LocaleController.getString(R.string.CarTabAudio))
+                    .build(), MediaBrowser.MediaItem.FLAG_BROWSABLE));
+            mediaItems.add(new MediaBrowser.MediaItem(new android.media.MediaDescription.Builder()
+                    .setMediaId(MEDIA_ID_VIDEO_LIBRARY)
+                    .setTitle(LocaleController.getString(R.string.CarTabVideos))
+                    .build(), MediaBrowser.MediaItem.FLAG_BROWSABLE));
+        } else if (MEDIA_ID_LIBRARY.equals(parentMediaId)) {
             for (int a = 0; a < dialogs.size(); a++) {
-                long dialogId = dialogs.get(a);
-                android.media.MediaDescription.Builder builder = new android.media.MediaDescription.Builder()
-                        .setMediaId(MEDIA_ID_CHAT_PREFIX + dialogId);
-                TLRPC.FileLocation avatar = null;
-                if (DialogObject.isUserDialog(dialogId)) {
-                    TLRPC.User user = users.get(dialogId);
-                    if (user != null) {
-                        builder.setTitle(ContactsController.formatName(user.first_name, user.last_name));
-                        if (user.photo != null && !(user.photo.photo_small instanceof TLRPC.TL_fileLocationUnavailable)) {
-                            avatar = user.photo.photo_small;
-                        }
-                    } else {
-                        builder.setTitle("DELETED USER");
-                    }
-                } else {
-                    TLRPC.Chat chat = chats.get(-dialogId);
-                    if (chat != null) {
-                        builder.setTitle(chat.title);
-                        if (chat.photo != null && !(chat.photo.photo_small instanceof TLRPC.TL_fileLocationUnavailable)) {
-                            avatar = chat.photo.photo_small;
-                        }
-                    } else {
-                        builder.setTitle("DELETED CHAT");
-                    }
-                }
-                Bitmap bitmap = null;
-                if (avatar != null) {
-                    bitmap = createRoundBitmap(FileLoader.getInstance(currentAccount).getPathToAttach(avatar, true));
-                    if (bitmap != null) {
-                        builder.setIconBitmap(bitmap);
-                    }
-                }
-                if (avatar == null || bitmap == null) {
-                    builder.setIconUri(Uri.parse("android.resource://" + appContext.getPackageName() + "/drawable/contact_blue"));
-                }
-                mediaItems.add(new MediaBrowser.MediaItem(builder.build(), MediaBrowser.MediaItem.FLAG_BROWSABLE));
+                mediaItems.add(buildChatItem(MEDIA_ID_CHAT_PREFIX, dialogs.get(a), null));
             }
-        } else if (parentMediaId != null && parentMediaId.startsWith(MEDIA_ID_CHAT_PREFIX)) {
-            long did = 0;
-            try {
-                did = Long.parseLong(parentMediaId.replace(MEDIA_ID_CHAT_PREFIX, ""));
-            } catch (Exception e) {
-                FileLog.e(e);
+        } else if (MEDIA_ID_VIDEO_LIBRARY.equals(parentMediaId)) {
+            for (int a = 0; a < videoDialogs.size(); a++) {
+                mediaItems.add(buildChatItem(MEDIA_ID_VIDEO_CHAT_PREFIX, videoDialogs.get(a), null));
             }
+        } else if (getDialogIdFromMediaId(parentMediaId) != 0) {
+            long did = getDialogIdFromMediaId(parentMediaId);
+            boolean videos = parentMediaId.startsWith(MEDIA_ID_VIDEO_CHAT_PREFIX);
             ArrayList<MessageObject> arrayList = audioObjects.get(did);
             if (arrayList != null) {
                 for (int a = 0; a < arrayList.size(); a++) {
                     MessageObject messageObject = arrayList.get(a);
-                    android.media.MediaDescription.Builder builder = new android.media.MediaDescription.Builder()
-                            .setMediaId(did + "_" + a);
-                    builder.setTitle(getAudioTitle(messageObject));
-                    builder.setSubtitle(messageObject.getMusicAuthor());
-                    String videoLabel = getVideoLabel(messageObject);
-                    if (videoLabel != null) {
-                        builder.setDescription(videoLabel);
+                    if (isCarVideo(messageObject) == videos) {
+                        mediaItems.add(buildPlayableItem(did + "_" + a, messageObject, null));
                     }
-                    Bitmap cover = getAudioCover(messageObject);
-                    if (cover != null) {
-                        builder.setIconBitmap(cover);
-                    }
-                    mediaItems.add(new MediaBrowser.MediaItem(builder.build(), MediaBrowser.MediaItem.FLAG_PLAYABLE));
                 }
             }
         }
         return mediaItems;
+    }
+
+    private final android.util.SparseArray<Bitmap> specialAvatars = new android.util.SparseArray<>();
+
+    /** Telegram's own round avatar for Saved Messages and Replies. */
+    @Nullable
+    private Bitmap getSpecialAvatar(int avatarType) {
+        Bitmap bitmap = specialAvatars.get(avatarType);
+        if (bitmap == null) {
+            try {
+                int size = 256;
+                bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
+                org.telegram.ui.Components.AvatarDrawable drawable = new org.telegram.ui.Components.AvatarDrawable();
+                drawable.setAvatarType(avatarType);
+                drawable.setBounds(0, 0, size, size);
+                drawable.draw(new Canvas(bitmap));
+                specialAvatars.put(avatarType, bitmap);
+            } catch (Throwable e) {
+                FileLog.e(e);
+                return null;
+            }
+        }
+        return bitmap;
+    }
+
+    private MediaBrowser.MediaItem buildChatItem(String prefix, long dialogId, @Nullable String subtitle) {
+        return buildChatItem(prefix, dialogId, subtitle, null);
+    }
+
+    private MediaBrowser.MediaItem buildChatItem(String prefix, long dialogId, @Nullable String subtitle, @Nullable Bundle extras) {
+        android.media.MediaDescription.Builder builder = new android.media.MediaDescription.Builder()
+                .setMediaId(prefix + dialogId);
+        builder.setTitle(getDialogTitle(dialogId));
+        TLRPC.FileLocation avatar = null;
+        boolean savedMessages = dialogId == UserConfig.getInstance(currentAccount).getClientUserId();
+        Bitmap specialAvatar = savedMessages ? getSpecialAvatar(org.telegram.ui.Components.AvatarDrawable.AVATAR_TYPE_SAVED)
+                : UserObject.isReplyUser(dialogId) ? getSpecialAvatar(org.telegram.ui.Components.AvatarDrawable.AVATAR_TYPE_REPLIES) : null;
+        if (specialAvatar != null) {
+            builder.setIconBitmap(specialAvatar);
+        } else if (DialogObject.isUserDialog(dialogId)) {
+            TLRPC.User user = MessagesController.getInstance(currentAccount).getUser(dialogId);
+            if (user == null) {
+                user = users.get(dialogId);
+            }
+            if (user != null && user.photo != null && !(user.photo.photo_small instanceof TLRPC.TL_fileLocationUnavailable)) {
+                avatar = user.photo.photo_small;
+            }
+        } else {
+            TLRPC.Chat chat = MessagesController.getInstance(currentAccount).getChat(-dialogId);
+            if (chat == null) {
+                chat = chats.get(-dialogId);
+            }
+            if (chat != null && chat.photo != null && !(chat.photo.photo_small instanceof TLRPC.TL_fileLocationUnavailable)) {
+                avatar = chat.photo.photo_small;
+            }
+        }
+        Bitmap bitmap = null;
+        if (avatar != null) {
+            bitmap = createRoundBitmap(FileLoader.getInstance(currentAccount).getPathToAttach(avatar, true));
+            if (bitmap != null) {
+                builder.setIconBitmap(bitmap);
+            }
+        }
+        if (specialAvatar == null && (avatar == null || bitmap == null)) {
+            builder.setIconUri(Uri.parse("android.resource://" + appContext.getPackageName() + "/drawable/contact_blue"));
+        }
+        if (subtitle != null) {
+            builder.setSubtitle(subtitle);
+        }
+        if (extras != null) {
+            builder.setExtras(extras);
+        }
+        return new MediaBrowser.MediaItem(builder.build(), MediaBrowser.MediaItem.FLAG_BROWSABLE);
+    }
+
+    private MediaBrowser.MediaItem buildPlayableItem(String mediaId, MessageObject messageObject, @Nullable Bundle extras) {
+        android.media.MediaDescription.Builder builder = new android.media.MediaDescription.Builder()
+                .setMediaId(mediaId)
+                .setTitle(getAudioTitle(messageObject));
+        String author = messageObject.getMusicAuthor();
+        String videoLabel = getVideoLabel(messageObject);
+        if (videoLabel != null) {
+            author = TextUtils.isEmpty(author) ? videoLabel : videoLabel + " \u00B7 " + author;
+        }
+        builder.setSubtitle(author);
+        Bitmap cover = getAudioCover(messageObject);
+        if (cover != null) {
+            builder.setIconBitmap(cover);
+        } else {
+            builder.setIconUri(getFallbackCoverUri(isCarVideo(messageObject)));
+        }
+        if (extras != null) {
+            builder.setExtras(extras);
+        }
+        return new MediaBrowser.MediaItem(builder.build(), MediaBrowser.MediaItem.FLAG_PLAYABLE);
+    }
+
+    /** Media browser search: returns playable items across all chats. */
+    private static final String CONTENT_STYLE_GROUP_TITLE_HINT = "android.media.browse.CONTENT_STYLE_GROUP_TITLE_HINT";
+    private static Bundle groupExtras(String title) {
+        Bundle extras = new Bundle();
+        extras.putString(CONTENT_STYLE_GROUP_TITLE_HINT, title);
+        return extras;
+    }
+
+    /** Media browser search: matching chats, then matching audio from all chats. */
+    public void searchBrowseItems(String query, BrowseChildrenCallback callback) {
+        String normalized = normalizeQuery(query);
+        searchAudio(0, query, results -> {
+            List<MediaBrowser.MediaItem> items = new ArrayList<>();
+            if (!normalized.isEmpty()) {
+                Bundle extras = groupExtras(LocaleController.getString(R.string.CarSearchChats));
+                for (int a = 0; a < dialogs.size(); a++) {
+                    long dialogId = dialogs.get(a);
+                    if (matchesQuery(getDialogTitle(dialogId), normalized)) {
+                        items.add(buildChatItem(MEDIA_ID_CHAT_PREFIX, dialogId, LocaleController.getString(R.string.CarTabAudio), extras));
+                    }
+                }
+                for (int a = 0; a < videoDialogs.size(); a++) {
+                    long dialogId = videoDialogs.get(a);
+                    if (matchesQuery(getDialogTitle(dialogId), normalized)) {
+                        items.add(buildChatItem(MEDIA_ID_VIDEO_CHAT_PREFIX, dialogId, LocaleController.getString(R.string.CarTabVideos), extras));
+                    }
+                }
+            }
+            Bundle otherExtras = groupExtras(LocaleController.getString(R.string.CarSearchAllAudio));
+            for (AudioSearchResult result : results) {
+                android.media.MediaDescription.Builder builder = new android.media.MediaDescription.Builder()
+                        .setMediaId(MEDIA_ID_MESSAGE_PREFIX + result.dialogId + "_" + result.messageId)
+                        .setTitle(result.title)
+                        .setExtras(otherExtras);
+                String subtitle = result.author;
+                String chat = getDialogTitle(result.dialogId);
+                subtitle = subtitle.isEmpty() ? chat : subtitle + " \u00B7 " + chat;
+                if (result.videoLabel != null) {
+                    subtitle = subtitle.isEmpty() ? result.videoLabel : result.videoLabel + " \u00B7 " + subtitle;
+                }
+                builder.setSubtitle(subtitle);
+                builder.setIconUri(getFallbackCoverUri(result.videoLabel != null));
+                items.add(new MediaBrowser.MediaItem(builder.build(), MediaBrowser.MediaItem.FLAG_PLAYABLE));
+            }
+            callback.onResult(items);
+        });
     }
 
     private void applyQueueFor(long did) {
@@ -833,15 +1325,7 @@ public class TelegramMediaSession {
         ArrayList<MediaSessionCompat.QueueItem> queueList = audioQueues.get(did);
         if (arrayList == null || arrayList.isEmpty() || queueList == null) return;
         session.setQueue(queueList);
-        if (DialogObject.isUserDialog(did)) {
-            TLRPC.User user = users.get(did);
-            session.setQueueTitle(user != null
-                    ? ContactsController.formatName(user.first_name, user.last_name)
-                    : "DELETED USER");
-        } else {
-            TLRPC.Chat chat = chats.get(-did);
-            session.setQueueTitle(chat != null ? chat.title : "DELETED CHAT");
-        }
+        session.setQueueTitle(getDialogTitle(did));
         MessageObject messageObject = arrayList.get(0);
         MediaMetadataCompat.Builder mb = new MediaMetadataCompat.Builder()
                 .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, (long) (messageObject.getDuration() * 1000))
@@ -930,7 +1414,58 @@ public class TelegramMediaSession {
         return result;
     }
 
+    private long nowPlayingCoverKey;
+    private Bitmap nowPlayingCover;
+
+    /** Larger cover for the now-playing screen: embedded album art first, then the file thumbnail. */
+    @Nullable
+    public Bitmap getNowPlayingCover(MessageObject messageObject) {
+        TLRPC.Document document = messageObject != null ? messageObject.getDocument() : null;
+        if (document == null) {
+            return null;
+        }
+        AudioInfo audioInfo = MediaController.getInstance().getAudioInfo();
+        Bitmap embedded = audioInfo != null ? audioInfo.getCover() : null;
+        long key = embedded != null ? -document.id : document.id;
+        if (nowPlayingCover != null && nowPlayingCoverKey == key) {
+            return nowPlayingCover;
+        }
+        Bitmap bitmap = null;
+        try {
+            if (embedded != null && !embedded.isRecycled()) {
+                bitmap = cropAndScale(embedded, NOW_PLAYING_COVER_SIZE_PX, false);
+            } else if (document.thumbs != null && !document.thumbs.isEmpty()) {
+                TLRPC.PhotoSize thumb = FileLoader.getClosestPhotoSizeWithSize(document.thumbs, 320, false, null, true);
+                if (thumb != null) {
+                    if (thumb.bytes != null && thumb.bytes.length > 0) {
+                        bitmap = decodeCover(null, thumb.bytes, NOW_PLAYING_COVER_SIZE_PX);
+                    } else {
+                        File path = FileLoader.getInstance(messageObject.currentAccount).getPathToAttach(thumb, true);
+                        if (path != null && path.exists()) {
+                            bitmap = decodeCover(path, null, NOW_PLAYING_COVER_SIZE_PX);
+                        } else {
+                            getAudioCover(messageObject);
+                        }
+                    }
+                }
+            }
+        } catch (Throwable e) {
+            FileLog.e(e);
+        }
+        if (bitmap != null) {
+            nowPlayingCover = bitmap;
+            nowPlayingCoverKey = key;
+        }
+        return bitmap;
+    }
+
+    private static final int NOW_PLAYING_COVER_SIZE_PX = 320;
+
     private static Bitmap decodeCover(@Nullable File file, @Nullable byte[] bytes) {
+        return decodeCover(file, bytes, COVER_SIZE_PX);
+    }
+
+    private static Bitmap decodeCover(@Nullable File file, @Nullable byte[] bytes, int sizePx) {
         BitmapFactory.Options bounds = new BitmapFactory.Options();
         bounds.inJustDecodeBounds = true;
         if (file != null) {
@@ -939,7 +1474,7 @@ public class TelegramMediaSession {
             BitmapFactory.decodeByteArray(bytes, 0, bytes.length, bounds);
         }
         int sample = 1;
-        while (bounds.outWidth / (sample * 2) >= COVER_SIZE_PX && bounds.outHeight / (sample * 2) >= COVER_SIZE_PX) {
+        while (bounds.outWidth / (sample * 2) >= sizePx && bounds.outHeight / (sample * 2) >= sizePx) {
             sample *= 2;
         }
         BitmapFactory.Options options = new BitmapFactory.Options();
@@ -951,14 +1486,18 @@ public class TelegramMediaSession {
             return null;
         }
         // Keep covers small: the whole list is sent to the car host in one binder transaction.
-        int side = Math.min(decoded.getWidth(), decoded.getHeight());
-        Bitmap square = Bitmap.createBitmap(decoded, (decoded.getWidth() - side) / 2,
-                (decoded.getHeight() - side) / 2, side, side);
-        Bitmap scaled = Bitmap.createScaledBitmap(square, COVER_SIZE_PX, COVER_SIZE_PX, true);
-        if (square != decoded) {
-            decoded.recycle();
+        return cropAndScale(decoded, sizePx, true);
+    }
+
+    private static Bitmap cropAndScale(Bitmap source, int sizePx, boolean recycleSource) {
+        int side = Math.min(source.getWidth(), source.getHeight());
+        Bitmap square = Bitmap.createBitmap(source, (source.getWidth() - side) / 2,
+                (source.getHeight() - side) / 2, side, side);
+        Bitmap scaled = Bitmap.createScaledBitmap(square, sizePx, sizePx, true);
+        if (recycleSource && square != source) {
+            source.recycle();
         }
-        if (scaled != square) {
+        if (scaled != square && square != source) {
             square.recycle();
         }
         return scaled;
@@ -1149,6 +1688,17 @@ public class TelegramMediaSession {
         @Override
         public void onPlayFromMediaId(String mediaId, Bundle extras) {
             if (TextUtils.isEmpty(mediaId)) return;
+            if (mediaId.startsWith(MEDIA_ID_MESSAGE_PREFIX)) {
+                String[] parts = mediaId.substring(MEDIA_ID_MESSAGE_PREFIX.length()).split("_");
+                if (parts.length == 2) {
+                    try {
+                        playAudioMessage(Long.parseLong(parts[0]), Integer.parseInt(parts[1]));
+                    } catch (Exception e) {
+                        FileLog.e(e);
+                    }
+                }
+                return;
+            }
             String[] args = mediaId.split("_");
             if (args.length != 2) return;
             try {
@@ -1163,25 +1713,12 @@ public class TelegramMediaSession {
         @Override
         public void onPlayFromSearch(String query, Bundle extras) {
             if (query == null || query.length() == 0) return;
-            String q = query.toLowerCase();
+            String q = normalizeQuery(query);
             for (int a = 0; a < dialogs.size(); a++) {
                 long did = dialogs.get(a);
-                if (DialogObject.isUserDialog(did)) {
-                    TLRPC.User user = users.get(did);
-                    if (user == null) continue;
-                    String first = user.first_name != null ? user.first_name.toLowerCase() : null;
-                    String last = user.last_name != null ? user.last_name.toLowerCase() : null;
-                    if (first != null && first.contains(q) || last != null && last.contains(q)) {
-                        onPlayFromMediaId(did + "_" + 0, null);
-                        return;
-                    }
-                } else {
-                    TLRPC.Chat chat = chats.get(-did);
-                    if (chat == null) continue;
-                    if (chat.title != null && chat.title.toLowerCase().contains(q)) {
-                        onPlayFromMediaId(did + "_" + 0, null);
-                        return;
-                    }
+                if (matchesQuery(getDialogTitle(did), q)) {
+                    onPlayFromMediaId(did + "_" + 0, null);
+                    return;
                 }
             }
         }
@@ -1199,7 +1736,15 @@ public class TelegramMediaSession {
             } else if (MusicPlayerService.NOTIFY_SHUFFLE.equals(action)) {
                 MediaController.getInstance().setPlaybackOrderType(SharedConfig.shuffleMusic ? 0 : 2);
                 updateShuffleMode();
+            } else {
+                return;
             }
+            AndroidUtilities.runOnUIThread(() -> {
+                if (org.telegram.ui.Components.AudioPlayerAlert.instance != null) {
+                    org.telegram.ui.Components.AudioPlayerAlert.instance.updateRepeatButton();
+                }
+            });
+            notifyPlayStateForNotificationRefresh();
         }
     }
 }

@@ -485,10 +485,10 @@ public class MusicPlayerService extends Service implements NotificationCenter.No
                 }
             } else {
                 long actions = PlaybackStateCompat.ACTION_PLAY_PAUSE | PlaybackStateCompat.ACTION_PLAY | PlaybackStateCompat.ACTION_PAUSE | PlaybackStateCompat.ACTION_SEEK_TO | PlaybackStateCompat.ACTION_SET_REPEAT_MODE | PlaybackStateCompat.ACTION_SET_SHUFFLE_MODE;
-                if (messageObject.isMusic()) {
+                if (hasPlaylistControls(messageObject)) {
                     actions |= PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS | PlaybackStateCompat.ACTION_SKIP_TO_NEXT;
                 }
-                if (messageObject.isMusic()) {
+                if (hasPlaylistControls(messageObject)) {
                     int shuffleIcon = SharedConfig.shuffleMusic ? R.drawable.player_new_shuffle : R.drawable.player_new_shuffle_off;
                     playbackState.addCustomAction(new PlaybackStateCompat.CustomAction.Builder(
                             NOTIFY_SHUFFLE, LocaleController.getString(R.string.ShuffleList), shuffleIcon).build());
@@ -497,7 +497,7 @@ public class MusicPlayerService extends Service implements NotificationCenter.No
                                 MediaController.getInstance().getPlayingMessageObject().audioProgressSec * 1000L,
                                 getPlaybackSpeed(isPlaying, messageObject))
                         .setActions(actions);
-                if (messageObject.isMusic()) {
+                if (hasPlaylistControls(messageObject)) {
                     int repeatIcon;
                     switch (SharedConfig.repeatMode) {
                         case 1: repeatIcon = R.drawable.player_new_repeatall; break;
@@ -732,7 +732,7 @@ public class MusicPlayerService extends Service implements NotificationCenter.No
         } else {
             long actions = PlaybackStateCompat.ACTION_PLAY_PAUSE | PlaybackStateCompat.ACTION_PLAY | PlaybackStateCompat.ACTION_PAUSE | PlaybackStateCompat.ACTION_SEEK_TO | PlaybackStateCompat.ACTION_SET_REPEAT_MODE | PlaybackStateCompat.ACTION_SET_SHUFFLE_MODE;
             MessageObject messageObject = MediaController.getInstance().getPlayingMessageObject();
-            if (messageObject != null && messageObject.isMusic()) {
+            if (hasPlaylistControls(messageObject)) {
                 actions |= PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS | PlaybackStateCompat.ACTION_SKIP_TO_NEXT;
                 int shuffleIcon = SharedConfig.shuffleMusic ? R.drawable.player_new_shuffle : R.drawable.player_new_shuffle_off;
                 playbackState.addCustomAction(new PlaybackStateCompat.CustomAction.Builder(
@@ -742,7 +742,7 @@ public class MusicPlayerService extends Service implements NotificationCenter.No
                             seekTo,
                             getPlaybackSpeed(isPlaying, messageObject))
                     .setActions(actions);
-            if (messageObject != null && messageObject.isMusic()) {
+            if (hasPlaylistControls(messageObject)) {
                 int repeatIcon;
                 switch (SharedConfig.repeatMode) {
                     case 1: repeatIcon = R.drawable.player_new_repeatall; break;
@@ -756,6 +756,11 @@ public class MusicPlayerService extends Service implements NotificationCenter.No
         PlaybackStateCompat builtState = playbackState.build();
         mediaSession.setPlaybackState(builtState);
         TelegramMediaSession.mirrorPlayerState(builtState);
+    }
+
+    private static boolean hasPlaylistControls(MessageObject messageObject) {
+        return messageObject != null
+                && (messageObject.isMusic() || MediaController.getInstance().isInCarVoiceQueue(messageObject));
     }
 
     private void updateRepeatMode() {

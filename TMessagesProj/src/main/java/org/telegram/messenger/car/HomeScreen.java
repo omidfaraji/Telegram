@@ -24,7 +24,6 @@ import androidx.car.app.model.Tab;
 import androidx.car.app.model.TabContents;
 import androidx.car.app.model.TabTemplate;
 import androidx.car.app.model.Template;
-import androidx.car.app.model.Toggle;
 import androidx.car.app.messaging.model.CarMessage;
 import androidx.car.app.messaging.model.ConversationCallback;
 import androidx.car.app.messaging.model.ConversationItem;
@@ -66,16 +65,14 @@ public class HomeScreen extends Screen
     private static final String TAB_MUSIC = "tab_music";
 
     private static final int MAX_CONVERSATIONS = 6;
-    private static final int MAX_FALLBACK_CONVERSATIONS = 5;
     private static final int MAX_MESSAGES_PER_CONV = 5;
-    private static final int AUDIO_RESERVED_ROWS = 2;
+    private static final int MAX_MUSIC_DIALOGS = 50;
 
     private final long sessionStartMillis;
     private int currentAccount;
 
-    private String activeTabId = TAB_MUSIC;
+    private String activeTabId = TAB_NOTIFICATIONS;
     private boolean musicLoadKicked;
-    private int visibleAudioDialogs = CarListLimits.LOAD_MORE_STEP;
 
     public HomeScreen(@NonNull CarContext carContext) {
         super(carContext);
@@ -89,7 +86,6 @@ public class HomeScreen extends Screen
         NotificationCenter.getGlobalInstance().addObserver(this, NotificationCenter.pushMessagesUpdated);
         NotificationCenter.getGlobalInstance().addObserver(this, NotificationCenter.notificationsCountUpdated);
         NotificationCenter.getGlobalInstance().addObserver(this, NotificationCenter.activeAccountChanged);
-        addAccountObservers();
     }
 
     @Override
@@ -97,49 +93,13 @@ public class HomeScreen extends Screen
         NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.pushMessagesUpdated);
         NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.notificationsCountUpdated);
         NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.activeAccountChanged);
-        removeAccountObservers();
-    }
-
-    private void addAccountObservers() {
-        NotificationCenter notificationCenter = NotificationCenter.getInstance(currentAccount);
-        notificationCenter.addObserver(this, NotificationCenter.didReceiveNewMessages);
-        notificationCenter.addObserver(this, NotificationCenter.messagesDeleted);
-        notificationCenter.addObserver(this, NotificationCenter.historyCleared);
-    }
-
-    private void removeAccountObservers() {
-        NotificationCenter notificationCenter = NotificationCenter.getInstance(currentAccount);
-        notificationCenter.removeObserver(this, NotificationCenter.didReceiveNewMessages);
-        notificationCenter.removeObserver(this, NotificationCenter.messagesDeleted);
-        notificationCenter.removeObserver(this, NotificationCenter.historyCleared);
     }
 
     @Override
     public void didReceivedNotification(int id, int account, Object... args) {
         if (id == NotificationCenter.activeAccountChanged) {
-            removeAccountObservers();
             currentAccount = UserConfig.selectedAccount;
             musicLoadKicked = false;
-            addAccountObservers();
-            invalidate();
-        } else if (id == NotificationCenter.didReceiveNewMessages
-                && args.length > 1
-                && args[1] instanceof ArrayList
-                && args[0] instanceof Long
-                && (args.length <= 2 || !Boolean.TRUE.equals(args[2]))) {
-            @SuppressWarnings("unchecked")
-            ArrayList<MessageObject> messages = (ArrayList<MessageObject>) args[1];
-            if (TelegramMediaSession.hasPlayableAudio(messages)) {
-                long dialogId = (Long) args[0];
-                TelegramMediaSession.getInstance(getCarContext().getApplicationContext())
-                        .refreshAudioData(dialogId, this::invalidate);
-            }
-            if (TAB_NOTIFICATIONS.equals(activeTabId)) {
-                invalidate();
-            }
-        } else if (id == NotificationCenter.messagesDeleted || id == NotificationCenter.historyCleared) {
-            TelegramMediaSession.getInstance(getCarContext().getApplicationContext())
-                    .refreshAudioCatalog(this::invalidate);
             invalidate();
         } else if ((id == NotificationCenter.pushMessagesUpdated || id == NotificationCenter.notificationsCountUpdated)
                 && TAB_NOTIFICATIONS.equals(activeTabId)) {
@@ -150,10 +110,6 @@ public class HomeScreen extends Screen
     @NonNull
     @Override
     public Template onGetTemplate() {
-        if (getCarContext().getCarAppApiLevel() < 6) {
-            return buildLegacyTemplate();
-        }
-
         TabTemplate.Builder builder = new TabTemplate.Builder(new TabTemplate.TabCallback() {
             @Override
             public void onTabSelected(@NonNull String tabContentId) {
@@ -171,39 +127,12 @@ public class HomeScreen extends Screen
         builder.addTab(new Tab.Builder()
                 .setContentId(TAB_MUSIC)
                 .setIcon(iconResource(R.drawable.filled_widget_music))
-                .setTitle(LocaleController.getString(R.string.CarAudio))
+                .setTitle(LocaleController.getString(R.string.Music))
                 .build());
 
         builder.setActiveTabContentId(activeTabId);
         builder.setTabContents(new TabContents.Builder(buildTabContent(activeTabId)).build());
         return builder.build();
-    }
-
-    private Template buildLegacyTemplate() {
-        ItemList.Builder list = new ItemList.Builder();
-        list.addItem(new Row.Builder()
-                .setTitle(LocaleController.getString(R.string.CarAudio))
-                .setBrowsable(true)
-                .setOnClickListener(() -> getScreenManager().push(
-                        new AudioChatsScreen(getCarContext(), 0)))
-                .build());
-
-        Map<Long, ArrayList<MessageObject>> grouped = collectUnreadDuringDrive();
-        if (grouped.isEmpty()) {
-            list.addItem(new Row.Builder()
-                    .setTitle(LocaleController.getString(R.string.NoNewCarMessages))
-                    .build());
-        } else {
-            int count = 0;
-            for (Map.Entry<Long, ArrayList<MessageObject>> entry : grouped.entrySet()) {
-                if (count++ >= MAX_FALLBACK_CONVERSATIONS) break;
-                ConversationItem item = buildConversationItem(entry.getKey(), entry.getValue());
-                if (item != null) list.addItem(item);
-            }
-        }
-        return new ListTemplate.Builder()
-                .setSingleList(list.build())
-                .build();
     }
 
     private Template buildTabContent(String tabId) {
@@ -361,36 +290,17 @@ public class HomeScreen extends Screen
             }
             return new ListTemplate.Builder().setLoading(true).build();
         }
-        ArrayList<Long> dialogs = session.getAudioDialogsSortedByVisibleOrder();
-        ItemList.Builder list = new ItemList.Builder();
-        // Tab contents have no header, so the video option is the first row here.
-        list.addItem(new Row.Builder()
-                .setTitle(LocaleController.getString(R.string.CarShowVideos))
-                .setToggle(new Toggle.Builder(checked -> {
-                    musicLoadKicked = false;
-                    session.setShowVideosEnabled(checked, this::invalidate);
-                }).setChecked(TelegramMediaSession.isShowVideosEnabled()).build())
-                .build());
+        ArrayList<Long> dialogs = session.getMusicDialogsSortedByVisibleOrder();
         if (dialogs == null || dialogs.isEmpty()) {
-            list.addItem(new Row.Builder()
-                    .setTitle(LocaleController.getString(R.string.NoAudioFiles))
-                    .build());
-            return new ListTemplate.Builder()
-                    .setSingleList(list.build())
+            return new MessageTemplate.Builder(LocaleController.getString(R.string.NoCarMusic))
                     .build();
         }
-        int maxCount = CarListLimits.maxCount(getCarContext(), AUDIO_RESERVED_ROWS);
-        visibleAudioDialogs = Math.max(1, Math.min(visibleAudioDialogs, maxCount));
+        ItemList.Builder list = new ItemList.Builder();
         int added = 0;
-        int nextIndex = dialogs.size();
-        for (int i = 0; i < dialogs.size(); i++) {
-            if (added >= visibleAudioDialogs) {
-                nextIndex = i;
-                break;
-            }
+        for (int i = 0; i < dialogs.size() && added < MAX_MUSIC_DIALOGS; i++) {
             long dialogId = dialogs.get(i);
-            int audioCount = session.getAudioMessageCount(dialogId);
-            if (audioCount == 0) continue;
+            ArrayList<MessageObject> messages = session.getMusicMessages(dialogId);
+            if (messages == null || messages.isEmpty()) continue;
             String title;
             TLRPC.FileLocation avatarLoc = null;
             if (DialogObject.isUserDialog(dialogId)) {
@@ -416,7 +326,7 @@ public class HomeScreen extends Screen
 
             Row.Builder row = new Row.Builder()
                     .setTitle(title)
-                    .addText(LocaleController.formatPluralString("AudioFiles", audioCount))
+                    .addText(LocaleController.formatPluralString("MusicFiles", messages.size()))
                     .setBrowsable(true)
                     .setOnClickListener(() -> getScreenManager().push(new MusicSongsScreen(getCarContext(), dialogId, title)));
 
@@ -428,22 +338,6 @@ public class HomeScreen extends Screen
             }
             list.addItem(row.build());
             added++;
-        }
-        if (nextIndex < dialogs.size()) {
-            final int startIndex = nextIndex;
-            Row.Builder more = new Row.Builder()
-                    .setTitle(LocaleController.getString(R.string.MoreAudioChats));
-            if (visibleAudioDialogs < maxCount) {
-                more.setOnClickListener(() -> {
-                    visibleAudioDialogs = Math.min(visibleAudioDialogs + CarListLimits.LOAD_MORE_STEP, maxCount);
-                    invalidate();
-                });
-            } else {
-                more.setBrowsable(true)
-                        .setOnClickListener(() -> getScreenManager().push(
-                                new AudioChatsScreen(getCarContext(), startIndex)));
-            }
-            list.addItem(more.build());
         }
         return new ListTemplate.Builder()
                 .setSingleList(list.build())

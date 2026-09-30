@@ -1,6 +1,5 @@
 package org.telegram.messenger.car;
 
-import android.graphics.Bitmap;
 import android.support.v4.media.session.MediaControllerCompat;
 
 import androidx.annotation.NonNull;
@@ -17,41 +16,27 @@ import androidx.core.graphics.drawable.IconCompat;
 import androidx.lifecycle.DefaultLifecycleObserver;
 import androidx.lifecycle.LifecycleOwner;
 
-import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.MediaController;
 import org.telegram.messenger.MessageObject;
 import org.telegram.messenger.NotificationCenter;
 import org.telegram.messenger.R;
 import org.telegram.messenger.TelegramMediaSession;
-import org.telegram.messenger.UserConfig;
 
 import java.util.ArrayList;
 
 public class MusicSongsScreen extends Screen
         implements DefaultLifecycleObserver, NotificationCenter.NotificationCenterDelegate {
 
-    private static final int RESERVED_ROWS = 2;
+    private static final int MAX_SONGS = 200;
 
     private final long dialogId;
     private final String title;
-    private final int startIndex;
-    private boolean audioLoadRequested;
-    private int currentAccount;
-    private boolean coverRefreshScheduled;
-    private int visibleCount;
 
     public MusicSongsScreen(@NonNull CarContext carContext, long dialogId, String title) {
-        this(carContext, dialogId, title, 0);
-    }
-
-    public MusicSongsScreen(@NonNull CarContext carContext, long dialogId, String title, int startIndex) {
         super(carContext);
         this.dialogId = dialogId;
         this.title = title != null ? title : "";
-        this.startIndex = Math.max(0, startIndex);
-        visibleCount = CarListLimits.initialCount(carContext, RESERVED_ROWS);
-        currentAccount = UserConfig.selectedAccount;
         getLifecycle().addObserver(this);
     }
 
@@ -60,7 +45,6 @@ public class MusicSongsScreen extends Screen
         NotificationCenter.getGlobalInstance().addObserver(this, NotificationCenter.messagePlayingDidStart);
         NotificationCenter.getGlobalInstance().addObserver(this, NotificationCenter.messagePlayingPlayStateChanged);
         NotificationCenter.getGlobalInstance().addObserver(this, NotificationCenter.activeAccountChanged);
-        addAccountObservers();
     }
 
     @Override
@@ -68,53 +52,12 @@ public class MusicSongsScreen extends Screen
         NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.messagePlayingDidStart);
         NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.messagePlayingPlayStateChanged);
         NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.activeAccountChanged);
-        removeAccountObservers();
-    }
-
-    private void addAccountObservers() {
-        NotificationCenter notificationCenter = NotificationCenter.getInstance(currentAccount);
-        notificationCenter.addObserver(this, NotificationCenter.didReceiveNewMessages);
-        notificationCenter.addObserver(this, NotificationCenter.messagesDeleted);
-        notificationCenter.addObserver(this, NotificationCenter.historyCleared);
-        notificationCenter.addObserver(this, NotificationCenter.fileLoaded);
-    }
-
-    private void removeAccountObservers() {
-        NotificationCenter notificationCenter = NotificationCenter.getInstance(currentAccount);
-        notificationCenter.removeObserver(this, NotificationCenter.didReceiveNewMessages);
-        notificationCenter.removeObserver(this, NotificationCenter.messagesDeleted);
-        notificationCenter.removeObserver(this, NotificationCenter.historyCleared);
-        notificationCenter.removeObserver(this, NotificationCenter.fileLoaded);
     }
 
     @Override
     public void didReceivedNotification(int id, int account, Object... args) {
         if (id == NotificationCenter.activeAccountChanged) {
-            removeAccountObservers();
-            currentAccount = UserConfig.selectedAccount;
-            addAccountObservers();
             getScreenManager().pop();
-            return;
-        } else if (id == NotificationCenter.didReceiveNewMessages
-                && args.length > 1
-                && args[0] instanceof Long
-                && (Long) args[0] == dialogId
-                && args[1] instanceof ArrayList
-                && (args.length <= 2 || !Boolean.TRUE.equals(args[2]))) {
-            @SuppressWarnings("unchecked")
-            ArrayList<MessageObject> messages = (ArrayList<MessageObject>) args[1];
-            if (TelegramMediaSession.hasPlayableAudio(messages)) {
-                TelegramMediaSession.getInstance(getCarContext().getApplicationContext())
-                        .refreshAudioData(dialogId, this::invalidate);
-            }
-            return;
-        } else if (id == NotificationCenter.fileLoaded) {
-            scheduleCoverRefresh();
-            return;
-        } else if (id == NotificationCenter.messagesDeleted || id == NotificationCenter.historyCleared) {
-            TelegramMediaSession.getInstance(getCarContext().getApplicationContext())
-                    .refreshAudioData(dialogId, this::invalidate);
-            audioLoadRequested = true;
             return;
         }
         invalidate();
@@ -126,23 +69,9 @@ public class MusicSongsScreen extends Screen
         TelegramMediaSession session = TelegramMediaSession.getInstance(getCarContext().getApplicationContext());
         String headerTitle = title.isEmpty() ? " " : title;
 
-        ArrayList<MessageObject> audioMessages = session.getAudioMessages(dialogId);
-        if (audioMessages == null) {
-            if (!audioLoadRequested) {
-                audioLoadRequested = true;
-                session.loadAudioMessages(dialogId, () -> {
-                    audioLoadRequested = false;
-                    invalidate();
-                });
-            }
-            return new ListTemplate.Builder()
-                    .setTitle(headerTitle)
-                    .setHeaderAction(Action.BACK)
-                    .setLoading(true)
-                    .build();
-        }
-        if (audioMessages.isEmpty()) {
-            return new MessageTemplate.Builder(LocaleController.getString(R.string.NoAudioFiles))
+        ArrayList<MessageObject> songs = session.getMusicMessages(dialogId);
+        if (songs == null || songs.isEmpty()) {
+            return new MessageTemplate.Builder(LocaleController.getString(R.string.NoCarMusic))
                     .setTitle(headerTitle)
                     .setHeaderAction(Action.BACK)
                     .build();
@@ -153,67 +82,27 @@ public class MusicSongsScreen extends Screen
         long playingDialog = playing != null ? playing.getDialogId() : 0;
 
         ItemList.Builder list = new ItemList.Builder();
-        int maxCount = CarListLimits.maxCount(getCarContext(), RESERVED_ROWS);
-        visibleCount = Math.min(visibleCount, maxCount);
-        int endIndex = Math.min(audioMessages.size(), startIndex + visibleCount);
-        for (int i = startIndex; i < endIndex; i++) {
-            MessageObject mo = audioMessages.get(i);
+        int limit = Math.min(songs.size(), MAX_SONGS);
+        for (int i = 0; i < limit; i++) {
+            MessageObject mo = songs.get(i);
             if (mo == null) continue;
-            String songTitle = TelegramMediaSession.getAudioTitle(mo);
+            String songTitle = mo.getMusicTitle();
             String author = mo.getMusicAuthor();
-            String videoLabel = TelegramMediaSession.getVideoLabel(mo);
 
             Row.Builder row = new Row.Builder()
                     .setTitle(songTitle != null ? songTitle : " ");
-            String details = author;
-            if (videoLabel != null) {
-                details = author != null && !author.isEmpty() ? videoLabel + " \u00B7 " + author : videoLabel;
-            }
-            if (details != null && !details.isEmpty()) {
-                row.addText(details);
+            if (author != null && !author.isEmpty()) {
+                row.addText(author);
             }
             boolean isCurrent = playing != null
                     && playingDialog == mo.getDialogId()
                     && playingId == mo.getId();
-            Bitmap cover = session.getAudioCover(mo);
-            IconCompat icon;
-            if (cover != null) {
-                icon = IconCompat.createWithBitmap(cover);
-            } else {
-                icon = IconCompat.createWithResource(getCarContext(),
-                        isCurrent ? R.drawable.ic_player
-                                : videoLabel != null ? R.drawable.msg_video : R.drawable.filled_widget_music);
-            }
-            row.setImage(new CarIcon.Builder(icon).build(), Row.IMAGE_TYPE_LARGE);
-            if (isCurrent && cover != null) {
-                row.setTitle("\u25B6 " + (songTitle != null ? songTitle : ""));
+            if (isCurrent) {
+                row.setImage(new CarIcon.Builder(IconCompat.createWithResource(getCarContext(), R.drawable.ic_player)).build());
             }
             final int index = i;
             row.setOnClickListener(() -> playAtIndex(index));
             list.addItem(row.build());
-        }
-        if (startIndex > 0) {
-            list.addItem(new Row.Builder()
-                    .setTitle(LocaleController.getString(R.string.PreviousAudioFiles))
-                    .setBrowsable(true)
-                    .setOnClickListener(() -> getScreenManager().pop())
-                    .build());
-        }
-        if (endIndex < audioMessages.size()) {
-            Row.Builder more = new Row.Builder()
-                    .setTitle(LocaleController.getString(R.string.MoreAudioFiles));
-            if (visibleCount < maxCount) {
-                // Grow the same list; only open another page when the host row limit is reached.
-                more.setOnClickListener(() -> {
-                    visibleCount = Math.min(visibleCount + CarListLimits.LOAD_MORE_STEP, maxCount);
-                    invalidate();
-                });
-            } else {
-                more.setBrowsable(true)
-                        .setOnClickListener(() -> getScreenManager().push(new MusicSongsScreen(
-                                getCarContext(), dialogId, title, endIndex)));
-            }
-            list.addItem(more.build());
         }
 
         return new ListTemplate.Builder()
@@ -221,17 +110,6 @@ public class MusicSongsScreen extends Screen
                 .setHeaderAction(Action.BACK)
                 .setSingleList(list.build())
                 .build();
-    }
-
-    private void scheduleCoverRefresh() {
-        if (coverRefreshScheduled) {
-            return;
-        }
-        coverRefreshScheduled = true;
-        AndroidUtilities.runOnUIThread(() -> {
-            coverRefreshScheduled = false;
-            invalidate();
-        }, 1000);
     }
 
     private void playAtIndex(int index) {
