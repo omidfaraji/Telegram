@@ -526,7 +526,9 @@ public class MusicPlayerService extends Service implements NotificationCenter.No
                 }
             }
 
-            mediaSession.setPlaybackState(playbackState.build());
+            PlaybackStateCompat builtState = playbackState.build();
+            mediaSession.setPlaybackState(builtState);
+            TelegramMediaSession.mirrorPlayerState(builtState);
             updateRepeatMode();
             updateShuffleMode();
             MediaMetadataCompat.Builder meta = new MediaMetadataCompat.Builder()
@@ -539,7 +541,9 @@ public class MusicPlayerService extends Service implements NotificationCenter.No
                 meta.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, fullAlbumArt);
             }
 
-            mediaSession.setMetadata(meta.build());
+            MediaMetadataCompat builtMetadata = meta.build();
+            mediaSession.setMetadata(builtMetadata);
+            TelegramMediaSession.mirrorPlayerMetadata(builtMetadata);
 
             bldr.setVisibility(Notification.VISIBILITY_PUBLIC);
 
@@ -749,7 +753,9 @@ public class MusicPlayerService extends Service implements NotificationCenter.No
                         NOTIFY_REPEAT, LocaleController.getString(R.string.RepeatSong), repeatIcon).build());
             }
         }
-        mediaSession.setPlaybackState(playbackState.build());
+        PlaybackStateCompat builtState = playbackState.build();
+        mediaSession.setPlaybackState(builtState);
+        TelegramMediaSession.mirrorPlayerState(builtState);
     }
 
     private void updateRepeatMode() {
@@ -822,6 +828,7 @@ public class MusicPlayerService extends Service implements NotificationCenter.No
         if (mediaSession != null) {
             mediaSession.release();
         }
+        TelegramMediaSession.clearPlayerState();
         for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
             NotificationCenter.getInstance(a).removeObserver(this, NotificationCenter.messagePlayingDidSeek);
             NotificationCenter.getInstance(a).removeObserver(this, NotificationCenter.messagePlayingPlayStateChanged);

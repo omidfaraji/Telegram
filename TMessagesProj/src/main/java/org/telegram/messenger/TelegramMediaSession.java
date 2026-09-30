@@ -61,6 +61,39 @@ public class TelegramMediaSession {
         return instance;
     }
 
+    // Android Auto shows its now-playing bar for the session exposed by MusicBrowserService,
+    // so mirror the player service session state here.
+    private static MediaMetadataCompat lastPlayerMetadata;
+    private static PlaybackStateCompat lastPlayerState;
+
+    public static void mirrorPlayerMetadata(MediaMetadataCompat metadata) {
+        lastPlayerMetadata = metadata;
+        TelegramMediaSession current = instance;
+        if (current != null) {
+            current.session.setMetadata(metadata);
+        }
+    }
+
+    public static void mirrorPlayerState(PlaybackStateCompat state) {
+        lastPlayerState = state;
+        TelegramMediaSession current = instance;
+        if (current != null) {
+            current.session.setPlaybackState(state);
+        }
+    }
+
+    public static void clearPlayerState() {
+        lastPlayerMetadata = null;
+        lastPlayerState = null;
+        TelegramMediaSession current = instance;
+        if (current != null) {
+            current.session.setPlaybackState(new PlaybackStateCompat.Builder()
+                    .setState(PlaybackStateCompat.STATE_STOPPED, 0, 0f)
+                    .setActions(current.getAvailableActions())
+                    .build());
+        }
+    }
+
     private static final String SESSION_TAG = "TelegramMediaSession";
     private static final String MEDIA_ID_ROOT = "__ROOT__";
     private static final String MEDIA_ID_CHAT_PREFIX = "__CHAT_";
@@ -123,6 +156,12 @@ public class TelegramMediaSession {
                 .setState(PlaybackStateCompat.STATE_NONE, 0, 1f)
                 .setActions(getAvailableActions());
         session.setPlaybackState(pb.build());
+        if (lastPlayerMetadata != null) {
+            session.setMetadata(lastPlayerMetadata);
+        }
+        if (lastPlayerState != null) {
+            session.setPlaybackState(lastPlayerState);
+        }
 
         updateRepeatMode();
         updateShuffleMode();
@@ -603,11 +642,13 @@ public class TelegramMediaSession {
             return;
         }
         ArrayList<MessageObject> messages = audioObjects.get(playing.getDialogId());
-        if (messages == null || messages.isEmpty()) {
-            return;
-        }
-        int index = messages.indexOf(playing);
+        int index = messages != null ? messages.indexOf(playing) : -1;
         if (index < 0) {
+            if (direction > 0) {
+                MediaController.getInstance().playNextMessage();
+            } else {
+                MediaController.getInstance().playPreviousMessage();
+            }
             return;
         }
         int nextIndex = (index + direction + messages.size()) % messages.size();
