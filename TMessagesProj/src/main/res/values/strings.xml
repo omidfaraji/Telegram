@@ -3929,6 +3929,12 @@
     <string name="FromYou">You</string>
     <string name="NoNewCarMessages">No new messages</string>
     <string name="NoCarMusic">No music in your chats</string>
+    <string name="CarAudio">Audio</string>
+    <string name="AudioChats">Audio chats</string>
+    <string name="MoreAudioChats">More audio chats</string>
+    <string name="PreviousAudioChats">Previous audio chats</string>
+    <string name="MoreAudioFiles">More audio files</string>
+    <string name="PreviousAudioFiles">Previous audio files</string>
     <string name="ActionTakeScreenshootYou">You took a screenshot!</string>
     <string name="ActionTakeScreenshoot">un1 took a screenshot!</string>
     <string name="Album">Album</string>
@@ -4860,6 +4866,8 @@
     <string name="Files_other">%1$d files</string>
     <string name="MusicFiles_one">%1$d music file</string>
     <string name="MusicFiles_other">%1$d music files</string>
+    <string name="AudioFiles_one">%1$d audio file</string>
+    <string name="AudioFiles_other">%1$d audio files</string>
     <string name="CommonGroups_one">%1$d group in common</string>
     <string name="CommonGroups_other">%1$d groups in common</string>
     <string name="Media_one">%1$d media</string>

@@ -28,15 +28,22 @@ import java.util.ArrayList;
 public class MusicSongsScreen extends Screen
         implements DefaultLifecycleObserver, NotificationCenter.NotificationCenterDelegate {
 
-    private static final int MAX_SONGS = 200;
+    private static final int PAGE_SIZE = 50;
 
     private final long dialogId;
     private final String title;
+    private final int startIndex;
+    private boolean audioLoadRequested;
 
     public MusicSongsScreen(@NonNull CarContext carContext, long dialogId, String title) {
+        this(carContext, dialogId, title, 0);
+    }
+
+    public MusicSongsScreen(@NonNull CarContext carContext, long dialogId, String title, int startIndex) {
         super(carContext);
         this.dialogId = dialogId;
         this.title = title != null ? title : "";
+        this.startIndex = Math.max(0, startIndex);
         getLifecycle().addObserver(this);
     }
 
@@ -69,9 +76,20 @@ public class MusicSongsScreen extends Screen
         TelegramMediaSession session = TelegramMediaSession.getInstance(getCarContext().getApplicationContext());
         String headerTitle = title.isEmpty() ? " " : title;
 
-        ArrayList<MessageObject> songs = session.getMusicMessages(dialogId);
-        if (songs == null || songs.isEmpty()) {
-            return new MessageTemplate.Builder(LocaleController.getString(R.string.NoCarMusic))
+        ArrayList<MessageObject> audioMessages = session.getAudioMessages(dialogId);
+        if (audioMessages == null) {
+            if (!audioLoadRequested) {
+                audioLoadRequested = true;
+                session.loadAudioMessages(dialogId, this::invalidate);
+            }
+            return new ListTemplate.Builder()
+                    .setTitle(headerTitle)
+                    .setHeaderAction(Action.BACK)
+                    .setLoading(true)
+                    .build();
+        }
+        if (audioMessages.isEmpty()) {
+            return new MessageTemplate.Builder(LocaleController.getString(R.string.NoAudioFiles))
                     .setTitle(headerTitle)
                     .setHeaderAction(Action.BACK)
                     .build();
@@ -82,9 +100,9 @@ public class MusicSongsScreen extends Screen
         long playingDialog = playing != null ? playing.getDialogId() : 0;
 
         ItemList.Builder list = new ItemList.Builder();
-        int limit = Math.min(songs.size(), MAX_SONGS);
-        for (int i = 0; i < limit; i++) {
-            MessageObject mo = songs.get(i);
+        int endIndex = Math.min(audioMessages.size(), startIndex + PAGE_SIZE);
+        for (int i = startIndex; i < endIndex; i++) {
+            MessageObject mo = audioMessages.get(i);
             if (mo == null) continue;
             String songTitle = mo.getMusicTitle();
             String author = mo.getMusicAuthor();
@@ -103,6 +121,22 @@ public class MusicSongsScreen extends Screen
             final int index = i;
             row.setOnClickListener(() -> playAtIndex(index));
             list.addItem(row.build());
+        }
+        if (startIndex > 0) {
+            list.addItem(new Row.Builder()
+                    .setTitle(LocaleController.getString(R.string.PreviousAudioFiles))
+                    .setBrowsable(true)
+                    .setOnClickListener(() -> getScreenManager().push(new MusicSongsScreen(
+                            getCarContext(), dialogId, title, Math.max(0, startIndex - PAGE_SIZE))))
+                    .build());
+        }
+        if (endIndex < audioMessages.size()) {
+            list.addItem(new Row.Builder()
+                    .setTitle(LocaleController.getString(R.string.MoreAudioFiles))
+                    .setBrowsable(true)
+                    .setOnClickListener(() -> getScreenManager().push(new MusicSongsScreen(
+                            getCarContext(), dialogId, title, endIndex)))
+                    .build());
         }
 
         return new ListTemplate.Builder()
