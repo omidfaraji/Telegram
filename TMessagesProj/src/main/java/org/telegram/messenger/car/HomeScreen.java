@@ -72,7 +72,7 @@ public class HomeScreen extends Screen
     private final long sessionStartMillis;
     private int currentAccount;
 
-    private String activeTabId = TAB_NOTIFICATIONS;
+    private String activeTabId = TAB_MUSIC;
     private boolean musicLoadKicked;
 
     public HomeScreen(@NonNull CarContext carContext) {
