@@ -351,7 +351,7 @@ public class MusicPlayerService extends Service implements NotificationCenter.No
 
     @SuppressLint("NewApi")
     private void createNotification(MessageObject messageObject, boolean forBitmap) {
-        String contentTitle = messageObject.getMusicTitle();
+        String contentTitle = TelegramMediaSession.getAudioTitle(messageObject);
         String contentText = messageObject.getMusicAuthor();
         AudioInfo audioInfo = MediaController.getInstance().getAudioInfo();
         Intent intent = new Intent(ApplicationLoader.applicationContext, LaunchActivity.class);

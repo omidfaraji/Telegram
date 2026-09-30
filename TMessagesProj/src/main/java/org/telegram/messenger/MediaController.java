@@ -130,6 +130,7 @@ import java.nio.channels.FileChannel;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Locale;
 import java.util.Timer;
 import java.util.TimerTask;
@@ -1033,6 +1034,34 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
     private Timer progressTimer = null;
     private final Object progressTimerSync = new Object();
     private boolean downloadingCurrentMessage;
+    // Videos queued from Android Auto are played through the audio player without a video surface.
+    private final HashSet<String> audioOnlyVideoKeys = new HashSet<>();
+
+    private static String audioOnlyKey(MessageObject messageObject) {
+        return messageObject.getDialogId() + "_" + messageObject.getId();
+    }
+
+    public void setAudioOnlyVideos(ArrayList<MessageObject> messageObjects) {
+        audioOnlyVideoKeys.clear();
+        if (messageObjects == null) {
+            return;
+        }
+        for (MessageObject messageObject : messageObjects) {
+            if (messageObject != null) {
+                audioOnlyVideoKeys.add(audioOnlyKey(messageObject));
+            }
+        }
+    }
+
+    public boolean isAudioOnlyVideo(MessageObject messageObject) {
+        return messageObject != null
+                && (messageObject.isVideo() || messageObject.isRoundVideo())
+                && audioOnlyVideoKeys.contains(audioOnlyKey(messageObject));
+    }
+
+    private boolean isVoiceLikeForPlaylist(MessageObject messageObject) {
+        return messageObject.isVoice() || isAudioOnlyVideo(messageObject);
+    }
     private boolean playMusicAgain;
     private PlaylistGlobalSearchParams playlistGlobalSearchParams;
     private AudioInfo audioInfo;
@@ -2918,7 +2947,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
     }
 
     public boolean hasNoNextVoiceOrRoundVideoMessage() {
-        return playingMessageObject == null || (!playingMessageObject.isVoice() && !playingMessageObject.isRoundVideo()) || voiceMessagesPlaylist == null || voiceMessagesPlaylist.size() <= 1 || !voiceMessagesPlaylist.contains(playingMessageObject) || voiceMessagesPlaylist.indexOf(playingMessageObject) >= (voiceMessagesPlaylist.size() - 1);
+        return playingMessageObject == null || (!playingMessageObject.isVoice() && !playingMessageObject.isRoundVideo() && !isAudioOnlyVideo(playingMessageObject)) || voiceMessagesPlaylist == null || voiceMessagesPlaylist.size() <= 1 || !voiceMessagesPlaylist.contains(playingMessageObject) || voiceMessagesPlaylist.indexOf(playingMessageObject) >= (voiceMessagesPlaylist.size() - 1);
     }
 
     public void playNextMessage() {
@@ -3078,6 +3107,9 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
             return;
         }
         MessageObject nextAudio = voiceMessagesPlaylist.get(1);
+        if (nextAudio.isVideo()) {
+            return;
+        }
         File file = null;
         if (nextAudio.messageOwner.attachPath != null && nextAudio.messageOwner.attachPath.length() > 0) {
             file = new File(nextAudio.messageOwner.attachPath);
@@ -3624,6 +3656,10 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
         }
         isSilent = silent;
         checkVolumeBarUI();
+        if (!audioOnlyVideoKeys.isEmpty() && !audioOnlyVideoKeys.contains(audioOnlyKey(messageObject))) {
+            audioOnlyVideoKeys.clear();
+        }
+        final boolean audioOnly = isAudioOnlyVideo(messageObject);
         if ((audioPlayer != null || videoPlayer != null) && isSamePlayingMessage(messageObject)) {
             if (isPaused) {
                 resumeAudio(messageObject);
@@ -3640,7 +3676,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
         boolean notify = !playMusicAgain;
         MessageObject oldMessageObject = playingMessageObject;
         if (playingMessageObject != null) {
-            if (playingMessageObject.isMusic() && messageObject.isVoice() || messageObject.isRoundVideo() || messageObject.isVideo()) {
+            if (!audioOnly && (playingMessageObject.isMusic() && messageObject.isVoice() || messageObject.isRoundVideo() || messageObject.isVideo())) {
                 saved = saveMusicPlaylistStateIfNeeded();
             }
             notify = false;
@@ -3664,7 +3700,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
             }
         }
         final File cacheFile = file != null ? file : FileLoader.getInstance(messageObject.currentAccount).getPathToMessage(messageObject.messageOwner);
-        boolean canStream = SharedConfig.streamMedia && (messageObject.isMusic() || messageObject.isRoundVideo() || messageObject.isVideo() && messageObject.canStreamVideo()) && !messageObject.shouldEncryptPhotoOrVideo() && !DialogObject.isEncryptedDialog(messageObject.getDialogId());
+        boolean canStream = SharedConfig.streamMedia && (messageObject.isMusic() || messageObject.isRoundVideo() || messageObject.isVideo() && (audioOnly || messageObject.canStreamVideo())) && !messageObject.shouldEncryptPhotoOrVideo() && !DialogObject.isEncryptedDialog(messageObject.getDialogId());
         if (cacheFile != file && !(exists = cacheFile.exists()) && !canStream) {
             FileLoader.getInstance(messageObject.currentAccount).loadFile(messageObject.getDocument(), messageObject, FileLoader.PRIORITY_LOW, messageObject.shouldEncryptPhotoOrVideo() ? 2 : 0);
             downloadingCurrentMessage = true;
@@ -3702,7 +3738,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
             currentAspectRatioFrameLayout.setDrawingReady(false);
         }
         boolean isVideo = messageObject.isVideo();
-        if (messageObject.isRoundVideo() || isVideo) {
+        if ((messageObject.isRoundVideo() || isVideo) && !audioOnly) {
             FileLoader.getInstance(messageObject.currentAccount).setLoadingVideoForPlayer(messageObject.getDocument(), true);
             playerWasReady = false;
             boolean destroyAtEnd = !isVideo || messageObject.messageOwner.peer_id.channel_id == 0 && messageObject.audioProgress <= 0.1f;
@@ -3879,7 +3915,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
                                 if (!playlist.isEmpty() && (playlist.size() > 1 || !messageObject.isVoice())) {
                                     playNextMessageWithoutOrder(true);
                                 } else {
-                                    cleanupPlayer(true, hasNoNextVoiceOrRoundVideoMessage(), messageObject.isVoice(), false);
+                                    cleanupPlayer(true, hasNoNextVoiceOrRoundVideoMessage(), isVoiceLikeForPlaylist(messageObject), false);
                                 }
                             }
                         } else if (audioPlayer != null && seekToProgressPending != 0 && (playbackState == ExoPlayer.STATE_READY || playbackState == ExoPlayer.STATE_IDLE)) {
@@ -3953,6 +3989,11 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
                     if (Math.abs(currentPlaybackSpeed - 1.0f) > 0.001f) {
                         audioPlayer.setPlaybackSpeed(Math.round(currentPlaybackSpeed * 10f) / 10f);
                     }
+                    audioInfo = null;
+                    if (!saved) {
+                        clearPlaylist();
+                    }
+                } else if (audioOnly) {
                     audioInfo = null;
                     if (!saved) {
                         clearPlaylist();
@@ -4244,7 +4285,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
     }
 
     private boolean canStartMusicPlayerService() {
-        return playingMessageObject != null && (playingMessageObject.isMusic() || playingMessageObject.isVoice() || playingMessageObject.isRoundVideo()) && !playingMessageObject.isVoiceOnce() && !playingMessageObject.isRoundOnce();
+        return playingMessageObject != null && (playingMessageObject.isMusic() || playingMessageObject.isVoice() || playingMessageObject.isRoundVideo() || isAudioOnlyVideo(playingMessageObject)) && !playingMessageObject.isVoiceOnce() && !playingMessageObject.isRoundOnce();
     }
     
     public void updateSilent(boolean value) {
