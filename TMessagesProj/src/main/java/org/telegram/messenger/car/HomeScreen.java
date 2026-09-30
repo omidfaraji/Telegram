@@ -65,6 +65,7 @@ public class HomeScreen extends Screen
     private static final String TAB_MUSIC = "tab_music";
 
     private static final int MAX_CONVERSATIONS = 6;
+    private static final int MAX_FALLBACK_CONVERSATIONS = 5;
     private static final int MAX_MESSAGES_PER_CONV = 5;
     private static final int MAX_AUDIO_DIALOGS = 50;
 
@@ -110,6 +111,10 @@ public class HomeScreen extends Screen
     @NonNull
     @Override
     public Template onGetTemplate() {
+        if (getCarContext().getCarAppApiLevel() < 6) {
+            return buildLegacyTemplate();
+        }
+
         TabTemplate.Builder builder = new TabTemplate.Builder(new TabTemplate.TabCallback() {
             @Override
             public void onTabSelected(@NonNull String tabContentId) {
@@ -133,6 +138,33 @@ public class HomeScreen extends Screen
         builder.setActiveTabContentId(activeTabId);
         builder.setTabContents(new TabContents.Builder(buildTabContent(activeTabId)).build());
         return builder.build();
+    }
+
+    private Template buildLegacyTemplate() {
+        ItemList.Builder list = new ItemList.Builder();
+        list.addItem(new Row.Builder()
+                .setTitle(LocaleController.getString(R.string.CarAudio))
+                .setBrowsable(true)
+                .setOnClickListener(() -> getScreenManager().push(
+                        new AudioChatsScreen(getCarContext(), 0)))
+                .build());
+
+        Map<Long, ArrayList<MessageObject>> grouped = collectUnreadDuringDrive();
+        if (grouped.isEmpty()) {
+            list.addItem(new Row.Builder()
+                    .setTitle(LocaleController.getString(R.string.NoNewCarMessages))
+                    .build());
+        } else {
+            int count = 0;
+            for (Map.Entry<Long, ArrayList<MessageObject>> entry : grouped.entrySet()) {
+                if (count++ >= MAX_FALLBACK_CONVERSATIONS) break;
+                ConversationItem item = buildConversationItem(entry.getKey(), entry.getValue());
+                if (item != null) list.addItem(item);
+            }
+        }
+        return new ListTemplate.Builder()
+                .setSingleList(list.build())
+                .build();
     }
 
     private Template buildTabContent(String tabId) {
