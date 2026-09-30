@@ -22,6 +22,7 @@ import android.support.v4.media.MediaMetadataCompat;
 import android.support.v4.media.session.MediaSessionCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
 import android.text.TextUtils;
+import android.util.LruCache;
 
 import androidx.annotation.Nullable;
 import androidx.collection.LongSparseArray;
@@ -723,6 +724,10 @@ public class TelegramMediaSession {
                             .setMediaId(did + "_" + a);
                     builder.setTitle(messageObject.getMusicTitle());
                     builder.setSubtitle(messageObject.getMusicAuthor());
+                    Bitmap cover = getAudioCover(messageObject);
+                    if (cover != null) {
+                        builder.setIconBitmap(cover);
+                    }
                     mediaItems.add(new MediaBrowser.MediaItem(builder.build(), MediaBrowser.MediaItem.FLAG_PLAYABLE));
                 }
             }
@@ -751,6 +756,90 @@ public class TelegramMediaSession {
                 .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, messageObject.getMusicAuthor())
                 .putString(MediaMetadataCompat.METADATA_KEY_TITLE, messageObject.getMusicTitle());
         session.setMetadata(mb.build());
+    }
+
+    private static final int COVER_SIZE_PX = 64;
+    private final LruCache<Long, Bitmap> coverCache = new LruCache<Long, Bitmap>(8 * 1024 * 1024) {
+        @Override
+        protected int sizeOf(Long key, Bitmap value) {
+            return value.getByteCount();
+        }
+    };
+    private final Set<Long> requestedCovers = new HashSet<>();
+
+    /**
+     * Returns the cover photo of an audio message, or null if it has none or it is not available yet.
+     * Missing covers are downloaded; observe NotificationCenter.fileLoaded to refresh.
+     */
+    @Nullable
+    public Bitmap getAudioCover(MessageObject messageObject) {
+        TLRPC.Document document = messageObject != null ? messageObject.getDocument() : null;
+        if (document == null || document.thumbs == null || document.thumbs.isEmpty()) {
+            return null;
+        }
+        Bitmap cached = coverCache.get(document.id);
+        if (cached != null) {
+            return cached;
+        }
+        TLRPC.PhotoSize thumb = FileLoader.getClosestPhotoSizeWithSize(document.thumbs, 320, false, null, true);
+        if (thumb == null) {
+            return null;
+        }
+        Bitmap bitmap = null;
+        try {
+            if (thumb.bytes != null && thumb.bytes.length > 0) {
+                bitmap = decodeCover(null, thumb.bytes);
+            } else {
+                File path = FileLoader.getInstance(messageObject.currentAccount).getPathToAttach(thumb, true);
+                if (path != null && path.exists()) {
+                    bitmap = decodeCover(path, null);
+                } else if (requestedCovers.add(document.id)) {
+                    FileLoader.getInstance(messageObject.currentAccount).loadFile(
+                            ImageLocation.getForDocument(thumb, document), messageObject, "jpg",
+                            FileLoader.PRIORITY_NORMAL, 1);
+                }
+            }
+        } catch (Throwable e) {
+            FileLog.e(e);
+        }
+        if (bitmap != null) {
+            coverCache.put(document.id, bitmap);
+        }
+        return bitmap;
+    }
+
+    private static Bitmap decodeCover(@Nullable File file, @Nullable byte[] bytes) {
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        if (file != null) {
+            BitmapFactory.decodeFile(file.getAbsolutePath(), bounds);
+        } else {
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.length, bounds);
+        }
+        int sample = 1;
+        while (bounds.outWidth / (sample * 2) >= COVER_SIZE_PX && bounds.outHeight / (sample * 2) >= COVER_SIZE_PX) {
+            sample *= 2;
+        }
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inSampleSize = sample;
+        Bitmap decoded = file != null
+                ? BitmapFactory.decodeFile(file.getAbsolutePath(), options)
+                : BitmapFactory.decodeByteArray(bytes, 0, bytes.length, options);
+        if (decoded == null) {
+            return null;
+        }
+        // Keep covers small: the whole list is sent to the car host in one binder transaction.
+        int side = Math.min(decoded.getWidth(), decoded.getHeight());
+        Bitmap square = Bitmap.createBitmap(decoded, (decoded.getWidth() - side) / 2,
+                (decoded.getHeight() - side) / 2, side, side);
+        Bitmap scaled = Bitmap.createScaledBitmap(square, COVER_SIZE_PX, COVER_SIZE_PX, true);
+        if (square != decoded) {
+            decoded.recycle();
+        }
+        if (scaled != square) {
+            square.recycle();
+        }
+        return scaled;
     }
 
     public void publishMetadata(MessageObject messageObject, @Nullable AudioInfo audioInfo, @Nullable Bitmap albumArt) {
