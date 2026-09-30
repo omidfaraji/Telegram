@@ -83,6 +83,8 @@ public class TelegramMediaSession {
 
     private boolean chatsLoaded;
     private boolean loadingChats;
+    private int audioCatalogRevision;
+    private final ArrayList<Runnable> pendingCatalogCallbacks = new ArrayList<>();
     private final ArrayList<Long> dialogs = new ArrayList<>();
     private final LongSparseArray<TLRPC.User> users = new LongSparseArray<>();
     private final LongSparseArray<TLRPC.Chat> chats = new LongSparseArray<>();
@@ -135,10 +137,12 @@ public class TelegramMediaSession {
 
     private void onAccountSwitched() {
         currentAccount = UserConfig.selectedAccount;
+        audioCatalogRevision++;
         lastSelectedDialog = AndroidUtilities.getPrefIntOrLong(
                 MessagesController.getNotificationsSettings(currentAccount), "auto_lastSelectedDialog", 0);
         chatsLoaded = false;
         loadingChats = false;
+        pendingCatalogCallbacks.clear();
         dialogs.clear();
         users.clear();
         chats.clear();
@@ -250,6 +254,41 @@ public class TelegramMediaSession {
         loadAudioForDialog(dialogId, onLoaded);
     }
 
+    public void refreshAudioCatalog(Runnable onLoaded) {
+        refreshAudioData(0, onLoaded);
+    }
+
+    public void refreshAudioData(long dialogId, Runnable onLoaded) {
+        AndroidUtilities.runOnUIThread(() -> {
+            audioCatalogRevision++;
+            chatsLoaded = false;
+            dialogs.clear();
+            users.clear();
+            chats.clear();
+            audioObjects.clear();
+            audioQueues.clear();
+            audioCounts.clear();
+            if (dialogId != 0 && onLoaded != null) {
+                pendingCatalogCallbacks.add(() -> loadAudioForDialog(dialogId, onLoaded));
+            } else if (onLoaded != null) {
+                pendingCatalogCallbacks.add(onLoaded);
+            }
+            loadChats();
+        });
+    }
+
+    public static boolean hasPlayableAudio(ArrayList<MessageObject> messages) {
+        if (messages == null) {
+            return false;
+        }
+        for (MessageObject message : messages) {
+            if (message != null && (message.isMusic() || message.isVoice() && !message.isVoiceOnce())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public Bitmap getRoundedAvatar(File path) {
         return createRoundBitmap(path);
     }
@@ -299,6 +338,7 @@ public class TelegramMediaSession {
         loadingChats = true;
 
         final int account = currentAccount;
+        final int revision = audioCatalogRevision;
         MessagesStorage messagesStorage = MessagesStorage.getInstance(account);
         messagesStorage.getStorageQueue().postRunnable(() -> {
             ArrayList<Long> loadedDialogs = new ArrayList<>();
@@ -394,6 +434,11 @@ public class TelegramMediaSession {
                 if (account != currentAccount) {
                     return;
                 }
+                if (revision != audioCatalogRevision) {
+                    loadingChats = false;
+                    loadChats();
+                    return;
+                }
                 dialogs.clear();
                 dialogs.addAll(loadedDialogs);
                 audioCounts.clear();
@@ -419,6 +464,11 @@ public class TelegramMediaSession {
                 for (int i = 0; i < requests.size(); i++) {
                     PendingBrowseRequest request = requests.get(i);
                     loadBrowseChildren(request.parentMediaId, request.callback);
+                }
+                ArrayList<Runnable> callbacks = new ArrayList<>(pendingCatalogCallbacks);
+                pendingCatalogCallbacks.clear();
+                for (Runnable callback : callbacks) {
+                    callback.run();
                 }
             });
         });

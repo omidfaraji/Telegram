@@ -87,6 +87,7 @@ public class HomeScreen extends Screen
         NotificationCenter.getGlobalInstance().addObserver(this, NotificationCenter.pushMessagesUpdated);
         NotificationCenter.getGlobalInstance().addObserver(this, NotificationCenter.notificationsCountUpdated);
         NotificationCenter.getGlobalInstance().addObserver(this, NotificationCenter.activeAccountChanged);
+        addAccountObservers();
     }
 
     @Override
@@ -94,13 +95,49 @@ public class HomeScreen extends Screen
         NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.pushMessagesUpdated);
         NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.notificationsCountUpdated);
         NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.activeAccountChanged);
+        removeAccountObservers();
+    }
+
+    private void addAccountObservers() {
+        NotificationCenter notificationCenter = NotificationCenter.getInstance(currentAccount);
+        notificationCenter.addObserver(this, NotificationCenter.didReceiveNewMessages);
+        notificationCenter.addObserver(this, NotificationCenter.messagesDeleted);
+        notificationCenter.addObserver(this, NotificationCenter.historyCleared);
+    }
+
+    private void removeAccountObservers() {
+        NotificationCenter notificationCenter = NotificationCenter.getInstance(currentAccount);
+        notificationCenter.removeObserver(this, NotificationCenter.didReceiveNewMessages);
+        notificationCenter.removeObserver(this, NotificationCenter.messagesDeleted);
+        notificationCenter.removeObserver(this, NotificationCenter.historyCleared);
     }
 
     @Override
     public void didReceivedNotification(int id, int account, Object... args) {
         if (id == NotificationCenter.activeAccountChanged) {
+            removeAccountObservers();
             currentAccount = UserConfig.selectedAccount;
             musicLoadKicked = false;
+            addAccountObservers();
+            invalidate();
+        } else if (id == NotificationCenter.didReceiveNewMessages
+                && args.length > 1
+                && args[1] instanceof ArrayList
+                && args[0] instanceof Long
+                && (args.length <= 2 || !Boolean.TRUE.equals(args[2]))) {
+            @SuppressWarnings("unchecked")
+            ArrayList<MessageObject> messages = (ArrayList<MessageObject>) args[1];
+            if (TelegramMediaSession.hasPlayableAudio(messages)) {
+                long dialogId = (Long) args[0];
+                TelegramMediaSession.getInstance(getCarContext().getApplicationContext())
+                        .refreshAudioData(dialogId, this::invalidate);
+            }
+            if (TAB_NOTIFICATIONS.equals(activeTabId)) {
+                invalidate();
+            }
+        } else if (id == NotificationCenter.messagesDeleted || id == NotificationCenter.historyCleared) {
+            TelegramMediaSession.getInstance(getCarContext().getApplicationContext())
+                    .refreshAudioCatalog(this::invalidate);
             invalidate();
         } else if ((id == NotificationCenter.pushMessagesUpdated || id == NotificationCenter.notificationsCountUpdated)
                 && TAB_NOTIFICATIONS.equals(activeTabId)) {

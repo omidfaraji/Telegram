@@ -22,6 +22,7 @@ import org.telegram.messenger.MessageObject;
 import org.telegram.messenger.NotificationCenter;
 import org.telegram.messenger.R;
 import org.telegram.messenger.TelegramMediaSession;
+import org.telegram.messenger.UserConfig;
 
 import java.util.ArrayList;
 
@@ -34,6 +35,7 @@ public class MusicSongsScreen extends Screen
     private final String title;
     private final int startIndex;
     private boolean audioLoadRequested;
+    private int currentAccount;
 
     public MusicSongsScreen(@NonNull CarContext carContext, long dialogId, String title) {
         this(carContext, dialogId, title, 0);
@@ -44,6 +46,7 @@ public class MusicSongsScreen extends Screen
         this.dialogId = dialogId;
         this.title = title != null ? title : "";
         this.startIndex = Math.max(0, startIndex);
+        currentAccount = UserConfig.selectedAccount;
         getLifecycle().addObserver(this);
     }
 
@@ -52,6 +55,7 @@ public class MusicSongsScreen extends Screen
         NotificationCenter.getGlobalInstance().addObserver(this, NotificationCenter.messagePlayingDidStart);
         NotificationCenter.getGlobalInstance().addObserver(this, NotificationCenter.messagePlayingPlayStateChanged);
         NotificationCenter.getGlobalInstance().addObserver(this, NotificationCenter.activeAccountChanged);
+        addAccountObservers();
     }
 
     @Override
@@ -59,12 +63,48 @@ public class MusicSongsScreen extends Screen
         NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.messagePlayingDidStart);
         NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.messagePlayingPlayStateChanged);
         NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.activeAccountChanged);
+        removeAccountObservers();
+    }
+
+    private void addAccountObservers() {
+        NotificationCenter notificationCenter = NotificationCenter.getInstance(currentAccount);
+        notificationCenter.addObserver(this, NotificationCenter.didReceiveNewMessages);
+        notificationCenter.addObserver(this, NotificationCenter.messagesDeleted);
+        notificationCenter.addObserver(this, NotificationCenter.historyCleared);
+    }
+
+    private void removeAccountObservers() {
+        NotificationCenter notificationCenter = NotificationCenter.getInstance(currentAccount);
+        notificationCenter.removeObserver(this, NotificationCenter.didReceiveNewMessages);
+        notificationCenter.removeObserver(this, NotificationCenter.messagesDeleted);
+        notificationCenter.removeObserver(this, NotificationCenter.historyCleared);
     }
 
     @Override
     public void didReceivedNotification(int id, int account, Object... args) {
         if (id == NotificationCenter.activeAccountChanged) {
+            removeAccountObservers();
+            currentAccount = UserConfig.selectedAccount;
+            addAccountObservers();
             getScreenManager().pop();
+            return;
+        } else if (id == NotificationCenter.didReceiveNewMessages
+                && args.length > 1
+                && args[0] instanceof Long
+                && (Long) args[0] == dialogId
+                && args[1] instanceof ArrayList
+                && (args.length <= 2 || !Boolean.TRUE.equals(args[2]))) {
+            @SuppressWarnings("unchecked")
+            ArrayList<MessageObject> messages = (ArrayList<MessageObject>) args[1];
+            if (TelegramMediaSession.hasPlayableAudio(messages)) {
+                TelegramMediaSession.getInstance(getCarContext().getApplicationContext())
+                        .refreshAudioData(dialogId, this::invalidate);
+            }
+            return;
+        } else if (id == NotificationCenter.messagesDeleted || id == NotificationCenter.historyCleared) {
+            TelegramMediaSession.getInstance(getCarContext().getApplicationContext())
+                    .refreshAudioData(dialogId, this::invalidate);
+            audioLoadRequested = true;
             return;
         }
         invalidate();
