@@ -24,6 +24,7 @@ import androidx.car.app.model.Tab;
 import androidx.car.app.model.TabContents;
 import androidx.car.app.model.TabTemplate;
 import androidx.car.app.model.Template;
+import androidx.car.app.model.Toggle;
 import androidx.car.app.messaging.model.CarMessage;
 import androidx.car.app.messaging.model.ConversationCallback;
 import androidx.car.app.messaging.model.ConversationItem;
@@ -67,13 +68,14 @@ public class HomeScreen extends Screen
     private static final int MAX_CONVERSATIONS = 6;
     private static final int MAX_FALLBACK_CONVERSATIONS = 5;
     private static final int MAX_MESSAGES_PER_CONV = 5;
-    private static final int MAX_AUDIO_DIALOGS = 50;
+    private static final int AUDIO_RESERVED_ROWS = 2;
 
     private final long sessionStartMillis;
     private int currentAccount;
 
     private String activeTabId = TAB_MUSIC;
     private boolean musicLoadKicked;
+    private int visibleAudioDialogs = CarListLimits.LOAD_MORE_STEP;
 
     public HomeScreen(@NonNull CarContext carContext) {
         super(carContext);
@@ -360,13 +362,32 @@ public class HomeScreen extends Screen
             return new ListTemplate.Builder().setLoading(true).build();
         }
         ArrayList<Long> dialogs = session.getAudioDialogsSortedByVisibleOrder();
+        ItemList.Builder list = new ItemList.Builder();
+        // Tab contents have no header, so the video option is the first row here.
+        list.addItem(new Row.Builder()
+                .setTitle(LocaleController.getString(R.string.CarShowVideos))
+                .setToggle(new Toggle.Builder(checked -> {
+                    musicLoadKicked = false;
+                    session.setShowVideosEnabled(checked, this::invalidate);
+                }).setChecked(TelegramMediaSession.isShowVideosEnabled()).build())
+                .build());
         if (dialogs == null || dialogs.isEmpty()) {
-            return new MessageTemplate.Builder(LocaleController.getString(R.string.NoAudioFiles))
+            list.addItem(new Row.Builder()
+                    .setTitle(LocaleController.getString(R.string.NoAudioFiles))
+                    .build());
+            return new ListTemplate.Builder()
+                    .setSingleList(list.build())
                     .build();
         }
-        ItemList.Builder list = new ItemList.Builder();
+        int maxCount = CarListLimits.maxCount(getCarContext(), AUDIO_RESERVED_ROWS);
+        visibleAudioDialogs = Math.max(1, Math.min(visibleAudioDialogs, maxCount));
         int added = 0;
-        for (int i = 0; i < dialogs.size() && added < MAX_AUDIO_DIALOGS; i++) {
+        int nextIndex = dialogs.size();
+        for (int i = 0; i < dialogs.size(); i++) {
+            if (added >= visibleAudioDialogs) {
+                nextIndex = i;
+                break;
+            }
             long dialogId = dialogs.get(i);
             int audioCount = session.getAudioMessageCount(dialogId);
             if (audioCount == 0) continue;
@@ -408,13 +429,21 @@ public class HomeScreen extends Screen
             list.addItem(row.build());
             added++;
         }
-        if (dialogs.size() > MAX_AUDIO_DIALOGS) {
-            list.addItem(new Row.Builder()
-                    .setTitle(LocaleController.getString(R.string.MoreAudioChats))
-                    .setBrowsable(true)
-                    .setOnClickListener(() -> getScreenManager().push(
-                            new AudioChatsScreen(getCarContext(), MAX_AUDIO_DIALOGS)))
-                    .build());
+        if (nextIndex < dialogs.size()) {
+            final int startIndex = nextIndex;
+            Row.Builder more = new Row.Builder()
+                    .setTitle(LocaleController.getString(R.string.MoreAudioChats));
+            if (visibleAudioDialogs < maxCount) {
+                more.setOnClickListener(() -> {
+                    visibleAudioDialogs = Math.min(visibleAudioDialogs + CarListLimits.LOAD_MORE_STEP, maxCount);
+                    invalidate();
+                });
+            } else {
+                more.setBrowsable(true)
+                        .setOnClickListener(() -> getScreenManager().push(
+                                new AudioChatsScreen(getCarContext(), startIndex)));
+            }
+            list.addItem(more.build());
         }
         return new ListTemplate.Builder()
                 .setSingleList(list.build())

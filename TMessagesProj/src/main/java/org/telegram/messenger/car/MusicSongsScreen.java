@@ -31,7 +31,7 @@ import java.util.ArrayList;
 public class MusicSongsScreen extends Screen
         implements DefaultLifecycleObserver, NotificationCenter.NotificationCenterDelegate {
 
-    private static final int PAGE_SIZE = 50;
+    private static final int RESERVED_ROWS = 2;
 
     private final long dialogId;
     private final String title;
@@ -39,6 +39,7 @@ public class MusicSongsScreen extends Screen
     private boolean audioLoadRequested;
     private int currentAccount;
     private boolean coverRefreshScheduled;
+    private int visibleCount;
 
     public MusicSongsScreen(@NonNull CarContext carContext, long dialogId, String title) {
         this(carContext, dialogId, title, 0);
@@ -49,6 +50,7 @@ public class MusicSongsScreen extends Screen
         this.dialogId = dialogId;
         this.title = title != null ? title : "";
         this.startIndex = Math.max(0, startIndex);
+        visibleCount = CarListLimits.initialCount(carContext, RESERVED_ROWS);
         currentAccount = UserConfig.selectedAccount;
         getLifecycle().addObserver(this);
     }
@@ -128,7 +130,10 @@ public class MusicSongsScreen extends Screen
         if (audioMessages == null) {
             if (!audioLoadRequested) {
                 audioLoadRequested = true;
-                session.loadAudioMessages(dialogId, this::invalidate);
+                session.loadAudioMessages(dialogId, () -> {
+                    audioLoadRequested = false;
+                    invalidate();
+                });
             }
             return new ListTemplate.Builder()
                     .setTitle(headerTitle)
@@ -148,7 +153,9 @@ public class MusicSongsScreen extends Screen
         long playingDialog = playing != null ? playing.getDialogId() : 0;
 
         ItemList.Builder list = new ItemList.Builder();
-        int endIndex = Math.min(audioMessages.size(), startIndex + PAGE_SIZE);
+        int maxCount = CarListLimits.maxCount(getCarContext(), RESERVED_ROWS);
+        visibleCount = Math.min(visibleCount, maxCount);
+        int endIndex = Math.min(audioMessages.size(), startIndex + visibleCount);
         for (int i = startIndex; i < endIndex; i++) {
             MessageObject mo = audioMessages.get(i);
             if (mo == null) continue;
@@ -189,17 +196,24 @@ public class MusicSongsScreen extends Screen
             list.addItem(new Row.Builder()
                     .setTitle(LocaleController.getString(R.string.PreviousAudioFiles))
                     .setBrowsable(true)
-                    .setOnClickListener(() -> getScreenManager().push(new MusicSongsScreen(
-                            getCarContext(), dialogId, title, Math.max(0, startIndex - PAGE_SIZE))))
+                    .setOnClickListener(() -> getScreenManager().pop())
                     .build());
         }
         if (endIndex < audioMessages.size()) {
-            list.addItem(new Row.Builder()
-                    .setTitle(LocaleController.getString(R.string.MoreAudioFiles))
-                    .setBrowsable(true)
-                    .setOnClickListener(() -> getScreenManager().push(new MusicSongsScreen(
-                            getCarContext(), dialogId, title, endIndex)))
-                    .build());
+            Row.Builder more = new Row.Builder()
+                    .setTitle(LocaleController.getString(R.string.MoreAudioFiles));
+            if (visibleCount < maxCount) {
+                // Grow the same list; only open another page when the host row limit is reached.
+                more.setOnClickListener(() -> {
+                    visibleCount = Math.min(visibleCount + CarListLimits.LOAD_MORE_STEP, maxCount);
+                    invalidate();
+                });
+            } else {
+                more.setBrowsable(true)
+                        .setOnClickListener(() -> getScreenManager().push(new MusicSongsScreen(
+                                getCarContext(), dialogId, title, endIndex)));
+            }
+            list.addItem(more.build());
         }
 
         return new ListTemplate.Builder()
