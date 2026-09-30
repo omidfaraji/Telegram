@@ -322,11 +322,70 @@ public class TelegramMediaSession {
             return false;
         }
         for (MessageObject message : messages) {
-            if (message != null && (message.isMusic() || message.isVoice() && !message.isVoiceOnce())) {
+            if (isCarPlayable(message)) {
                 return true;
             }
         }
         return false;
+    }
+
+    public static boolean isCarPlayable(MessageObject messageObject) {
+        if (messageObject == null || messageObject.getDocument() == null) {
+            return false;
+        }
+        if (messageObject.isMusic()) {
+            return true;
+        }
+        if (messageObject.isVoice()) {
+            return !messageObject.isVoiceOnce();
+        }
+        if (messageObject.isRoundVideo()) {
+            return !messageObject.isRoundOnce() && !messageObject.needDrawBluredPreview();
+        }
+        if (messageObject.isVideo()) {
+            return !messageObject.needDrawBluredPreview() && !messageObject.isSecretMedia();
+        }
+        return false;
+    }
+
+    public static boolean isCarVideo(MessageObject messageObject) {
+        return messageObject != null && (messageObject.isRoundVideo() || messageObject.isVideo());
+    }
+
+    @Nullable
+    public static String getVideoLabel(MessageObject messageObject) {
+        if (messageObject == null) {
+            return null;
+        }
+        if (messageObject.isRoundVideo()) {
+            return LocaleController.getString(R.string.AttachRound);
+        }
+        if (messageObject.isVideo()) {
+            return LocaleController.getString(R.string.AttachVideo);
+        }
+        return null;
+    }
+
+    public static String getAudioTitle(MessageObject messageObject) {
+        if (messageObject != null && !messageObject.isRoundVideo() && messageObject.isVideo()) {
+            String text = messageObject.messageOwner != null ? messageObject.messageOwner.message : null;
+            if (!TextUtils.isEmpty(text)) {
+                text = text.trim();
+                int newLine = text.indexOf('\n');
+                if (newLine > 0) {
+                    text = text.substring(0, newLine).trim();
+                }
+                if (text.length() > 80) {
+                    text = text.substring(0, 80).trim() + "\u2026";
+                }
+                if (!text.isEmpty()) {
+                    return text;
+                }
+            }
+            return LocaleController.getString(R.string.AttachVideo) + ", "
+                    + LocaleController.formatDateAudio(messageObject.messageOwner.date, true);
+        }
+        return messageObject != null ? messageObject.getMusicTitle() : null;
     }
 
     public Bitmap getRoundedAvatar(File path) {
@@ -407,7 +466,7 @@ public class TelegramMediaSession {
                 cursor.dispose();
 
                 LongSparseArray<Integer> voiceCounts = new LongSparseArray<>();
-                cursor = messagesStorage.getDatabase().queryFinalized(String.format(Locale.US, "SELECT data, mid, uid FROM media_v4 WHERE uid != 0 AND mid > 0 AND type = %d ORDER BY date, mid", MediaDataController.MEDIA_AUDIO));
+                cursor = messagesStorage.getDatabase().queryFinalized(String.format(Locale.US, "SELECT data, mid, uid FROM media_v4 WHERE uid != 0 AND mid > 0 AND type IN (%d, %d)", MediaDataController.MEDIA_AUDIO, MediaDataController.MEDIA_PHOTOVIDEO));
                 while (cursor.next()) {
                     long dialogId = cursor.longValue(2);
                     if (DialogObject.isEncryptedDialog(dialogId)) {
@@ -424,14 +483,17 @@ public class TelegramMediaSession {
                     }
                     message.readAttachPath(data, UserConfig.getInstance(account).clientUserId);
                     data.reuse();
-                    if (!MessageObject.isVoiceMessage(message)) {
+                    if (message.media instanceof TLRPC.TL_messageMediaPhoto
+                            || !MessageObject.isVoiceMessage(message)
+                            && !MessageObject.isRoundVideoMessage(message)
+                            && !MessageObject.isVideoMessage(message)) {
                         continue;
                     }
 
                     message.id = cursor.intValue(1);
                     message.dialog_id = dialogId;
                     MessageObject messageObject = new MessageObject(account, message, false, true);
-                    if (messageObject.isVoiceOnce()) {
+                    if (!isCarPlayable(messageObject)) {
                         continue;
                     }
                     Integer voiceCount = voiceCounts.get(dialogId);
@@ -535,7 +597,7 @@ public class TelegramMediaSession {
             ArrayList<MessageObject> arrayList = new ArrayList<>();
             ArrayList<MediaSessionCompat.QueueItem> queueList = new ArrayList<>();
             try {
-                SQLiteCursor cursor = messagesStorage.getDatabase().queryFinalized(String.format(Locale.US, "SELECT data, mid FROM media_v4 WHERE uid = %d AND mid > 0 AND type IN (%d, %d) ORDER BY date DESC, mid DESC", did, MediaDataController.MEDIA_AUDIO, MediaDataController.MEDIA_MUSIC));
+                SQLiteCursor cursor = messagesStorage.getDatabase().queryFinalized(String.format(Locale.US, "SELECT data, mid FROM media_v4 WHERE uid = %d AND mid > 0 AND type IN (%d, %d, %d) ORDER BY date DESC, mid DESC", did, MediaDataController.MEDIA_AUDIO, MediaDataController.MEDIA_MUSIC, MediaDataController.MEDIA_PHOTOVIDEO));
                 while (cursor.next()) {
                     NativeByteBuffer data = cursor.byteBufferValue(0);
                     if (data == null) {
@@ -548,10 +610,13 @@ public class TelegramMediaSession {
                     }
                     message.readAttachPath(data, UserConfig.getInstance(account).clientUserId);
                     data.reuse();
+                    if (message.media instanceof TLRPC.TL_messageMediaPhoto) {
+                        continue;
+                    }
                     message.id = cursor.intValue(1);
                     message.dialog_id = did;
                     MessageObject messageObject = new MessageObject(account, message, false, true);
-                    if (!messageObject.isMusic() && (!messageObject.isVoice() || messageObject.isVoiceOnce())) {
+                    if (!isCarPlayable(messageObject)) {
                         continue;
                     }
                     arrayList.add(messageObject);
@@ -562,7 +627,7 @@ public class TelegramMediaSession {
                     MessageObject messageObject = arrayList.get(i);
                     MediaDescriptionCompat description = new MediaDescriptionCompat.Builder()
                             .setMediaId(did + "_" + i)
-                            .setTitle(messageObject.getMusicTitle())
+                            .setTitle(getAudioTitle(messageObject))
                             .setSubtitle(messageObject.getMusicAuthor())
                             .build();
                     queueList.add(new MediaSessionCompat.QueueItem(description, i));
@@ -609,13 +674,16 @@ public class TelegramMediaSession {
 
         ArrayList<MessageObject> playlist = new ArrayList<>();
         for (MessageObject message : messages) {
-            if (selected.isMusic() && message.isMusic() || selected.isVoice() && message.isVoice()) {
+            if (selected.isMusic() == message.isMusic()) {
                 playlist.add(message);
             }
         }
         if (selected.isMusic()) {
+            controller.setAudioOnlyVideos(null);
             controller.setPlaylist(playlist, selected, 0, false, null);
-        } else if (selected.isVoice()) {
+        } else if (selected.isVoice() || isCarVideo(selected)) {
+            // Voice messages and videos share one queue; videos play as audio only.
+            controller.setAudioOnlyVideos(playlist);
             controller.setVoiceMessagesPlaylist(playlist, false);
             controller.playMessage(selected);
         } else {
@@ -722,8 +790,12 @@ public class TelegramMediaSession {
                     MessageObject messageObject = arrayList.get(a);
                     android.media.MediaDescription.Builder builder = new android.media.MediaDescription.Builder()
                             .setMediaId(did + "_" + a);
-                    builder.setTitle(messageObject.getMusicTitle());
+                    builder.setTitle(getAudioTitle(messageObject));
                     builder.setSubtitle(messageObject.getMusicAuthor());
+                    String videoLabel = getVideoLabel(messageObject);
+                    if (videoLabel != null) {
+                        builder.setDescription(videoLabel);
+                    }
                     Bitmap cover = getAudioCover(messageObject);
                     if (cover != null) {
                         builder.setIconBitmap(cover);
@@ -754,7 +826,7 @@ public class TelegramMediaSession {
         MediaMetadataCompat.Builder mb = new MediaMetadataCompat.Builder()
                 .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, (long) (messageObject.getDuration() * 1000))
                 .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, messageObject.getMusicAuthor())
-                .putString(MediaMetadataCompat.METADATA_KEY_TITLE, messageObject.getMusicTitle());
+                .putString(MediaMetadataCompat.METADATA_KEY_TITLE, getAudioTitle(messageObject));
         session.setMetadata(mb.build());
     }
 
@@ -803,9 +875,39 @@ public class TelegramMediaSession {
             FileLog.e(e);
         }
         if (bitmap != null) {
+            if (isCarVideo(messageObject)) {
+                bitmap = addVideoBadge(bitmap);
+            }
             coverCache.put(document.id, bitmap);
         }
         return bitmap;
+    }
+
+    private static Bitmap addVideoBadge(Bitmap source) {
+        Bitmap result = source.isMutable() ? source : source.copy(Bitmap.Config.ARGB_8888, true);
+        if (result == null) {
+            return source;
+        }
+        Canvas canvas = new Canvas(result);
+        float size = Math.min(result.getWidth(), result.getHeight());
+        float radius = size * 0.2f;
+        float cx = result.getWidth() - radius - size * 0.04f;
+        float cy = result.getHeight() - radius - size * 0.04f;
+        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        paint.setColor(0xC0000000);
+        canvas.drawCircle(cx, cy, radius, paint);
+        paint.setColor(Color.WHITE);
+        float triangle = radius * 0.5f;
+        android.graphics.Path path = new android.graphics.Path();
+        path.moveTo(cx - triangle * 0.6f, cy - triangle);
+        path.lineTo(cx + triangle, cy);
+        path.lineTo(cx - triangle * 0.6f, cy + triangle);
+        path.close();
+        canvas.drawPath(path, paint);
+        if (result != source) {
+            source.recycle();
+        }
+        return result;
     }
 
     private static Bitmap decodeCover(@Nullable File file, @Nullable byte[] bytes) {
@@ -848,7 +950,7 @@ public class TelegramMediaSession {
                 .putString(MediaMetadataCompat.METADATA_KEY_ALBUM_ARTIST, messageObject.getMusicAuthor())
                 .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, messageObject.getMusicAuthor())
                 .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, (long) (messageObject.getDuration() * 1000))
-                .putString(MediaMetadataCompat.METADATA_KEY_TITLE, messageObject.getMusicTitle())
+                .putString(MediaMetadataCompat.METADATA_KEY_TITLE, getAudioTitle(messageObject))
                 .putString(MediaMetadataCompat.METADATA_KEY_ALBUM,
                         audioInfo != null && messageObject.isMusic() ? audioInfo.getAlbum() : null);
         if (albumArt != null && !albumArt.isRecycled()) {
@@ -877,7 +979,7 @@ public class TelegramMediaSession {
             if (!MediaController.getInstance().isMessagePaused()) {
                 actions |= PlaybackStateCompat.ACTION_PAUSE;
             }
-            if (playing.isMusic() || playing.isVoice()) {
+            if (playing.isMusic() || playing.isVoice() || isCarVideo(playing)) {
                 actions |= PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS | PlaybackStateCompat.ACTION_SKIP_TO_NEXT;
             }
         }

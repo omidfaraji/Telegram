@@ -152,13 +152,18 @@ public class MusicSongsScreen extends Screen
         for (int i = startIndex; i < endIndex; i++) {
             MessageObject mo = audioMessages.get(i);
             if (mo == null) continue;
-            String songTitle = mo.getMusicTitle();
+            String songTitle = TelegramMediaSession.getAudioTitle(mo);
             String author = mo.getMusicAuthor();
+            String videoLabel = TelegramMediaSession.getVideoLabel(mo);
 
             Row.Builder row = new Row.Builder()
                     .setTitle(songTitle != null ? songTitle : " ");
-            if (author != null && !author.isEmpty()) {
-                row.addText(author);
+            String details = author;
+            if (videoLabel != null) {
+                details = author != null && !author.isEmpty() ? videoLabel + " \u00B7 " + author : videoLabel;
+            }
+            if (details != null && !details.isEmpty()) {
+                row.addText(details);
             }
             boolean isCurrent = playing != null
                     && playingDialog == mo.getDialogId()
@@ -169,7 +174,8 @@ public class MusicSongsScreen extends Screen
                 icon = IconCompat.createWithBitmap(cover);
             } else {
                 icon = IconCompat.createWithResource(getCarContext(),
-                        isCurrent ? R.drawable.ic_player : R.drawable.filled_widget_music);
+                        isCurrent ? R.drawable.ic_player
+                                : videoLabel != null ? R.drawable.msg_video : R.drawable.filled_widget_music);
             }
             row.setImage(new CarIcon.Builder(icon).build(), Row.IMAGE_TYPE_LARGE);
             if (isCurrent && cover != null) {
