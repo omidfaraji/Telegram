@@ -4,9 +4,9 @@ import androidx.annotation.NonNull;
 import androidx.car.app.CarContext;
 import androidx.car.app.Screen;
 import androidx.car.app.model.Action;
+import androidx.car.app.model.ActionStrip;
 import androidx.car.app.model.ItemList;
 import androidx.car.app.model.ListTemplate;
-import androidx.car.app.model.MessageTemplate;
 import androidx.car.app.model.Row;
 import androidx.car.app.model.Template;
 import androidx.lifecycle.DefaultLifecycleObserver;
@@ -28,14 +28,17 @@ import java.util.ArrayList;
 public class AudioChatsScreen extends Screen
         implements DefaultLifecycleObserver, NotificationCenter.NotificationCenterDelegate {
 
-    private static final int PAGE_SIZE = 50;
+    private static final int RESERVED_ROWS = 2;
 
     private final int startIndex;
     private int currentAccount;
+    private int visibleCount;
+    private boolean loadRequested;
 
     public AudioChatsScreen(@NonNull CarContext carContext, int startIndex) {
         super(carContext);
         this.startIndex = Math.max(0, startIndex);
+        visibleCount = CarListLimits.initialCount(carContext, RESERVED_ROWS);
         currentAccount = UserConfig.selectedAccount;
         getLifecycle().addObserver(this);
     }
@@ -94,16 +97,36 @@ public class AudioChatsScreen extends Screen
     @Override
     public Template onGetTemplate() {
         TelegramMediaSession session = TelegramMediaSession.getInstance(getCarContext().getApplicationContext());
-        ArrayList<Long> dialogs = session.getAudioDialogsSortedByVisibleOrder();
-        if (dialogs.isEmpty()) {
-            return new MessageTemplate.Builder(LocaleController.getString(R.string.NoAudioFiles))
+        if (!session.isChatsLoaded()) {
+            if (!loadRequested) {
+                loadRequested = true;
+                session.ensureLoaded(() -> {
+                    loadRequested = false;
+                    invalidate();
+                });
+            }
+            return new ListTemplate.Builder()
                     .setTitle(LocaleController.getString(R.string.AudioChats))
                     .setHeaderAction(Action.BACK)
+                    .setActionStrip(buildVideoToggleStrip())
+                    .setLoading(true)
+                    .build();
+        }
+        ArrayList<Long> dialogs = session.getAudioDialogsSortedByVisibleOrder();
+        ItemList.Builder list = new ItemList.Builder();
+        if (dialogs.isEmpty()) {
+            list.setNoItemsMessage(LocaleController.getString(R.string.NoAudioFiles));
+            return new ListTemplate.Builder()
+                    .setTitle(LocaleController.getString(R.string.AudioChats))
+                    .setHeaderAction(Action.BACK)
+                    .setActionStrip(buildVideoToggleStrip())
+                    .setSingleList(list.build())
                     .build();
         }
 
-        ItemList.Builder list = new ItemList.Builder();
-        int endIndex = Math.min(dialogs.size(), startIndex + PAGE_SIZE);
+        int maxCount = CarListLimits.maxCount(getCarContext(), RESERVED_ROWS);
+        visibleCount = Math.min(visibleCount, maxCount);
+        int endIndex = Math.min(dialogs.size(), startIndex + visibleCount);
         for (int i = startIndex; i < endIndex; i++) {
             long dialogId = dialogs.get(i);
             String title;
@@ -136,23 +159,42 @@ public class AudioChatsScreen extends Screen
             list.addItem(new Row.Builder()
                     .setTitle(LocaleController.getString(R.string.PreviousAudioChats))
                     .setBrowsable(true)
-                    .setOnClickListener(() -> getScreenManager().push(
-                            new AudioChatsScreen(getCarContext(), Math.max(0, startIndex - PAGE_SIZE))))
+                    .setOnClickListener(() -> getScreenManager().pop())
                     .build());
         }
         if (endIndex < dialogs.size()) {
-            list.addItem(new Row.Builder()
-                    .setTitle(LocaleController.getString(R.string.MoreAudioChats))
-                    .setBrowsable(true)
-                    .setOnClickListener(() -> getScreenManager().push(
-                            new AudioChatsScreen(getCarContext(), endIndex)))
-                    .build());
+            Row.Builder more = new Row.Builder()
+                    .setTitle(LocaleController.getString(R.string.MoreAudioChats));
+            if (visibleCount < maxCount) {
+                more.setOnClickListener(() -> {
+                    visibleCount = Math.min(visibleCount + CarListLimits.LOAD_MORE_STEP, maxCount);
+                    invalidate();
+                });
+            } else {
+                more.setBrowsable(true)
+                        .setOnClickListener(() -> getScreenManager().push(
+                                new AudioChatsScreen(getCarContext(), endIndex)));
+            }
+            list.addItem(more.build());
         }
 
         return new ListTemplate.Builder()
                 .setTitle(LocaleController.getString(R.string.AudioChats))
                 .setHeaderAction(Action.BACK)
+                .setActionStrip(buildVideoToggleStrip())
                 .setSingleList(list.build())
+                .build();
+    }
+
+    private ActionStrip buildVideoToggleStrip() {
+        boolean enabled = TelegramMediaSession.isShowVideosEnabled();
+        return new ActionStrip.Builder()
+                .addAction(new Action.Builder()
+                        .setTitle(LocaleController.getString(enabled ? R.string.CarVideosOn : R.string.CarVideosOff))
+                        .setOnClickListener(() -> TelegramMediaSession
+                                .getInstance(getCarContext().getApplicationContext())
+                                .setShowVideosEnabled(!enabled, this::invalidate))
+                        .build())
                 .build();
     }
 }

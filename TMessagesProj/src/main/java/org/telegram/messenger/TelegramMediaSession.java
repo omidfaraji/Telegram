@@ -329,6 +329,23 @@ public class TelegramMediaSession {
         return false;
     }
 
+    private static final String PREF_SHOW_VIDEOS = "car_show_videos";
+
+    public static boolean isShowVideosEnabled() {
+        return MessagesController.getGlobalMainSettings().getBoolean(PREF_SHOW_VIDEOS, false);
+    }
+
+    public void setShowVideosEnabled(boolean enabled, Runnable onLoaded) {
+        if (enabled == isShowVideosEnabled()) {
+            if (onLoaded != null) {
+                AndroidUtilities.runOnUIThread(onLoaded);
+            }
+            return;
+        }
+        MessagesController.getGlobalMainSettings().edit().putBoolean(PREF_SHOW_VIDEOS, enabled).apply();
+        refreshAudioCatalog(onLoaded);
+    }
+
     public static boolean isCarPlayable(MessageObject messageObject) {
         if (messageObject == null || messageObject.getDocument() == null) {
             return false;
@@ -338,6 +355,9 @@ public class TelegramMediaSession {
         }
         if (messageObject.isVoice()) {
             return !messageObject.isVoiceOnce();
+        }
+        if (!isShowVideosEnabled()) {
+            return false;
         }
         if (messageObject.isRoundVideo()) {
             return !messageObject.isRoundOnce() && !messageObject.needDrawBluredPreview();
