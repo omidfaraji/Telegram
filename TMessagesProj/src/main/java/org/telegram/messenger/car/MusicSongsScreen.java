@@ -1,5 +1,6 @@
 package org.telegram.messenger.car;
 
+import android.graphics.Bitmap;
 import android.support.v4.media.session.MediaControllerCompat;
 
 import androidx.annotation.NonNull;
@@ -16,6 +17,7 @@ import androidx.core.graphics.drawable.IconCompat;
 import androidx.lifecycle.DefaultLifecycleObserver;
 import androidx.lifecycle.LifecycleOwner;
 
+import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.MediaController;
 import org.telegram.messenger.MessageObject;
@@ -36,6 +38,7 @@ public class MusicSongsScreen extends Screen
     private final int startIndex;
     private boolean audioLoadRequested;
     private int currentAccount;
+    private boolean coverRefreshScheduled;
 
     public MusicSongsScreen(@NonNull CarContext carContext, long dialogId, String title) {
         this(carContext, dialogId, title, 0);
@@ -71,6 +74,7 @@ public class MusicSongsScreen extends Screen
         notificationCenter.addObserver(this, NotificationCenter.didReceiveNewMessages);
         notificationCenter.addObserver(this, NotificationCenter.messagesDeleted);
         notificationCenter.addObserver(this, NotificationCenter.historyCleared);
+        notificationCenter.addObserver(this, NotificationCenter.fileLoaded);
     }
 
     private void removeAccountObservers() {
@@ -78,6 +82,7 @@ public class MusicSongsScreen extends Screen
         notificationCenter.removeObserver(this, NotificationCenter.didReceiveNewMessages);
         notificationCenter.removeObserver(this, NotificationCenter.messagesDeleted);
         notificationCenter.removeObserver(this, NotificationCenter.historyCleared);
+        notificationCenter.removeObserver(this, NotificationCenter.fileLoaded);
     }
 
     @Override
@@ -100,6 +105,9 @@ public class MusicSongsScreen extends Screen
                 TelegramMediaSession.getInstance(getCarContext().getApplicationContext())
                         .refreshAudioData(dialogId, this::invalidate);
             }
+            return;
+        } else if (id == NotificationCenter.fileLoaded) {
+            scheduleCoverRefresh();
             return;
         } else if (id == NotificationCenter.messagesDeleted || id == NotificationCenter.historyCleared) {
             TelegramMediaSession.getInstance(getCarContext().getApplicationContext())
@@ -155,8 +163,17 @@ public class MusicSongsScreen extends Screen
             boolean isCurrent = playing != null
                     && playingDialog == mo.getDialogId()
                     && playingId == mo.getId();
-            if (isCurrent) {
-                row.setImage(new CarIcon.Builder(IconCompat.createWithResource(getCarContext(), R.drawable.ic_player)).build());
+            Bitmap cover = session.getAudioCover(mo);
+            IconCompat icon;
+            if (cover != null) {
+                icon = IconCompat.createWithBitmap(cover);
+            } else {
+                icon = IconCompat.createWithResource(getCarContext(),
+                        isCurrent ? R.drawable.ic_player : R.drawable.filled_widget_music);
+            }
+            row.setImage(new CarIcon.Builder(icon).build(), Row.IMAGE_TYPE_LARGE);
+            if (isCurrent && cover != null) {
+                row.setTitle("\u25B6 " + (songTitle != null ? songTitle : ""));
             }
             final int index = i;
             row.setOnClickListener(() -> playAtIndex(index));
@@ -184,6 +201,17 @@ public class MusicSongsScreen extends Screen
                 .setHeaderAction(Action.BACK)
                 .setSingleList(list.build())
                 .build();
+    }
+
+    private void scheduleCoverRefresh() {
+        if (coverRefreshScheduled) {
+            return;
+        }
+        coverRefreshScheduled = true;
+        AndroidUtilities.runOnUIThread(() -> {
+            coverRefreshScheduled = false;
+            invalidate();
+        }, 1000);
     }
 
     private void playAtIndex(int index) {
