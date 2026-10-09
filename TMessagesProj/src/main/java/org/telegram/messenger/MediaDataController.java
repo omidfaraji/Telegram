@@ -4882,7 +4882,7 @@ public class MediaDataController extends BaseController {
         messagesStorage.bindTaskToGuid(runnable, classGuid);
     }
 
-    private void putMediaDatabase(long uid, long topicId, int type, ArrayList<TLRPC.Message> messages, int max_id, int min_id, boolean topReached) {
+    void putMediaDatabase(long uid, long topicId, int type, ArrayList<TLRPC.Message> messages, int max_id, int min_id, boolean topReached) {
         getMessagesStorage().getStorageQueue().postRunnable(() -> {
             try {
                 if (min_id == 0 && (messages.isEmpty() || topReached)) {
