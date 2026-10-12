@@ -34,6 +34,7 @@ public class MusicBrowserService extends MediaBrowserServiceCompat {
         TelegramMediaSession holder = TelegramMediaSession.getInstance(this);
         setSessionToken(holder.getSessionToken());
         holder.setBrowseTreeListener(this::notifyChildrenChanged);
+        holder.refreshAudioCatalog(null);
     }
 
     @Override
@@ -63,8 +64,7 @@ public class MusicBrowserService extends MediaBrowserServiceCompat {
         TelegramMediaSession holder = TelegramMediaSession.getInstance(this);
         if (holder.isPasscodeLocked()) {
             Toast.makeText(getApplicationContext(), LocaleController.getString(R.string.EnterYourTelegramPasscode), Toast.LENGTH_LONG).show();
-            stopSelf();
-            result.detach();
+            result.sendResult(null);
             return;
         }
         result.detach();

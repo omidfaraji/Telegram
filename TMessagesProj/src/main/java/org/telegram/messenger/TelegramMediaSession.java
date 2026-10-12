@@ -194,6 +194,27 @@ public class TelegramMediaSession {
     private static final int CLOUD_AUDIO_PAGE_SIZE = 100;
     private final LongSparseArray<CloudAudioLoad> cloudAudioLoads = new LongSparseArray<>();
     private final Set<Integer> cloudRequestIds = new HashSet<>();
+    private long pendingPlayDialog;
+    private final Runnable pendingPlayTimeout = () -> {
+        if (pendingPlayDialog != 0) {
+            pendingPlayDialog = 0;
+            reportPlaybackError("Android Auto: timed out waiting for audio");
+        }
+    };
+
+    private void reportPlaybackError(String message) {
+        FileLog.e(message);
+        session.setPlaybackState(new PlaybackStateCompat.Builder()
+                .setState(PlaybackStateCompat.STATE_ERROR, 0, 0)
+                .setErrorMessage(message)
+                .setActions(getAvailableActions())
+                .build());
+    }
+
+    private void cancelPendingPlay() {
+        pendingPlayDialog = 0;
+        AndroidUtilities.cancelRunOnUIThread(pendingPlayTimeout);
+    }
 
     private static final class CloudAudioLoad {
         int filterIndex;
@@ -259,6 +280,7 @@ public class TelegramMediaSession {
     }
 
     private void onAccountSwitched() {
+        cancelPendingPlay();
         cancelCloudAudioRequests();
         currentAccount = UserConfig.selectedAccount;
         updateMessageObservers();
@@ -329,6 +351,7 @@ public class TelegramMediaSession {
     }
 
     public void release() {
+        cancelPendingPlay();
         cancelCloudAudioRequests();
         if (session != null) {
             session.release();
@@ -880,8 +903,12 @@ public class TelegramMediaSession {
             if (onLoaded != null) AndroidUtilities.runOnUIThread(onLoaded);
             return;
         }
-        loadBrowseChildren(MEDIA_ID_ROOT, items -> {
-            if (onLoaded != null) onLoaded.run();
+        loadBrowseChildren(MEDIA_ID_LIBRARY, items -> {
+            if (items == null) {
+                reportPlaybackError("Android Auto: could not load the audio catalog");
+            } else if (onLoaded != null) {
+                onLoaded.run();
+            }
         });
     }
 
@@ -898,6 +925,10 @@ public class TelegramMediaSession {
     private final ArrayList<PendingBrowseRequest> pendingBrowseRequests = new ArrayList<>();
 
     public void loadBrowseChildren(String parentMediaId, BrowseChildrenCallback callback) {
+        if (MEDIA_ID_ROOT.equals(parentMediaId)) {
+            callback.onResult(loadChildrenSync(parentMediaId));
+            return;
+        }
         if (!chatsLoaded) {
             pendingBrowseRequests.add(new PendingBrowseRequest(parentMediaId, callback));
             loadChats();
@@ -960,6 +991,7 @@ public class TelegramMediaSession {
             LongSparseArray<Integer> loadedDialogOrder = new LongSparseArray<>();
             ArrayList<Long> channelDialogs = new ArrayList<>();
             Set<Long> loadedPinned = new HashSet<>();
+            boolean loadSucceeded = false;
             try {
                 ArrayList<Long> usersToLoad = new ArrayList<>();
                 ArrayList<Long> chatsToLoad = new ArrayList<>();
@@ -1085,10 +1117,12 @@ public class TelegramMediaSession {
                     }
                     sortByChatListOrder(messagesStorage, channelDialogs);
                 }
+                loadSucceeded = true;
             } catch (Exception e) {
                 FileLog.e(e);
             }
 
+            final boolean succeeded = loadSucceeded;
             AndroidUtilities.runOnUIThread(() -> {
                 if (account != currentAccount) {
                     return;
@@ -1096,6 +1130,21 @@ public class TelegramMediaSession {
                 if (revision != audioCatalogRevision) {
                     loadingChats = false;
                     loadChats();
+                    return;
+                }
+                if (!succeeded) {
+                    loadingChats = false;
+                    chatsLoaded = false;
+                    ArrayList<PendingBrowseRequest> requests = new ArrayList<>(pendingBrowseRequests);
+                    pendingBrowseRequests.clear();
+                    for (PendingBrowseRequest request : requests) {
+                        request.callback.onResult(null);
+                    }
+                    ArrayList<Runnable> callbacks = new ArrayList<>(pendingCatalogCallbacks);
+                    pendingCatalogCallbacks.clear();
+                    for (Runnable callback : callbacks) {
+                        callback.run();
+                    }
                     return;
                 }
                 dialogs.clear();
@@ -1330,6 +1379,10 @@ public class TelegramMediaSession {
                     if (error != null || !(response instanceof TLRPC.messages_Messages)) {
                         FileLog.e("Android Auto: audio page failed for " + did + ": "
                                 + (error != null ? error.text : "invalid response"));
+                        if (pendingPlayDialog == did) {
+                            cancelPendingPlay();
+                            reportPlaybackError("Android Auto: could not load audio");
+                        }
                         return;
                     }
                     TLRPC.messages_Messages result = (TLRPC.messages_Messages) response;
@@ -1382,6 +1435,15 @@ public class TelegramMediaSession {
                     } else {
                         state.offsetId = nextOffset;
                     }
+                    if (pendingPlayDialog == did) {
+                        if (!messages.isEmpty()) {
+                            cancelPendingPlay();
+                            playAudio(did, 0);
+                        } else if (state.filterIndex >= 2) {
+                            cancelPendingPlay();
+                            reportPlaybackError("Android Auto: no playable audio in this chat");
+                        }
+                    }
                     loadCloudAudio(did);
                 }));
         cloudRequestIds.add(requestId[0]);
@@ -1415,9 +1477,21 @@ public class TelegramMediaSession {
             return;
         }
         if (index < 0 || index >= messages.size()) {
+            if (index == 0 && messages.isEmpty()) {
+                CloudAudioLoad load = cloudAudioLoads.get(dialogId);
+                if (load == null || load.filterIndex < 2) {
+                    cancelPendingPlay();
+                    pendingPlayDialog = dialogId;
+                    AndroidUtilities.runOnUIThread(pendingPlayTimeout, 15000);
+                    loadCloudAudio(dialogId);
+                    return;
+                }
+            }
+            reportPlaybackError("Android Auto: no playable audio at the requested position");
             return;
         }
 
+        cancelPendingPlay();
         MessageObject selected = messages.get(index);
         if (!isCarVideo(selected) && !FileLoader.getInstance(currentAccount).getPathToMessage(selected.messageOwner).exists()
                 && (TextUtils.isEmpty(selected.messageOwner.attachPath)
@@ -2098,9 +2172,13 @@ public class TelegramMediaSession {
         public void onPlay() {
             MessageObject messageObject = MediaController.getInstance().getPlayingMessageObject();
             if (messageObject == null) {
-                if (lastSelectedDialog != 0) {
-                    playAudio(lastSelectedDialog, 0);
-                }
+                ensureLoaded(() -> {
+                    if (lastSelectedDialog != 0) {
+                        playAudio(lastSelectedDialog, 0);
+                    } else {
+                        reportPlaybackError("Android Auto: no audio chat available");
+                    }
+                });
             } else {
                 MediaController.getInstance().playMessage(messageObject);
             }
@@ -2108,6 +2186,7 @@ public class TelegramMediaSession {
 
         @Override
         public void onPause() {
+            cancelPendingPlay();
             MediaController.getInstance().pauseMessage(MediaController.getInstance().getPlayingMessageObject());
         }
 
@@ -2225,6 +2304,7 @@ public class TelegramMediaSession {
 
         @Override
         public void onStop() {
+            cancelPendingPlay();
             // session stays alive; let MusicPlayerService handle notification + service teardown
         }
 
