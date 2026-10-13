@@ -3986,10 +3986,18 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
                                 }
                             }
                         } else if (audioPlayer != null && seekToProgressPending != 0 && (playbackState == ExoPlayer.STATE_READY || playbackState == ExoPlayer.STATE_IDLE)) {
-                            int seekTo = (int) (audioPlayer.getDuration() * seekToProgressPending);
+                            long playerDuration = audioPlayer.getDuration();
+                            int seekTo = (int) (playerDuration * seekToProgressPending);
+                            float seekProgress = seekToProgressPending;
                             audioPlayer.seekTo(seekTo);
                             lastProgress = seekTo;
                             seekToProgressPending = 0;
+                            if (playingMessageObject != null && playerDuration > 0) {
+                                playingMessageObject.audioPlayerDuration = (int) (playerDuration / 1000);
+                                playingMessageObject.audioProgress = seekProgress;
+                                playingMessageObject.audioProgressSec = seekTo / 1000;
+                                NotificationCenter.getInstance(playingMessageObject.currentAccount).postNotificationName(NotificationCenter.messagePlayingDidSeek, playingMessageObject.getId(), seekProgress);
+                            }
                         }
                         if (audioPlayer != null && CastSync.isActive()) {
                             audioPlayer.setMute(true);

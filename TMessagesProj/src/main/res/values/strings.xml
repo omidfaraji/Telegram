@@ -3931,6 +3931,14 @@
     <string name="NoCarMusic">No music in your chats</string>
     <string name="CarTabAudio">Audio</string>
     <string name="CarTabVideos">Videos</string>
+    <string name="CarTabFavorites">Favorites</string>
+    <string name="CarTabRecent">Recent</string>
+    <string name="CarClearRecent">Clear recent list</string>
+    <string name="CarPageNumber">Page %1$d</string>
+    <string name="CarNextPage">Next page (%1$d) ›</string>
+    <string name="CarPageRange">%1$d–%2$d</string>
+    <string name="CarAddFavorite">Add to favorites</string>
+    <string name="CarRemoveFavorite">Remove from favorites</string>
     <string name="CarSearchChats">Chats</string>
     <string name="CarSearchAllAudio">Audio</string>
     <string name="ActionTakeScreenshootYou">You took a screenshot!</string>

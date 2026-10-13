@@ -9,6 +9,7 @@
 package org.telegram.messenger;
 
 import android.annotation.TargetApi;
+import android.content.Intent;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Process;
@@ -34,7 +35,7 @@ public class MusicBrowserService extends MediaBrowserServiceCompat {
         TelegramMediaSession holder = TelegramMediaSession.getInstance(this);
         setSessionToken(holder.getSessionToken());
         holder.setBrowseTreeListener(this::notifyChildrenChanged);
-        holder.refreshAudioCatalog(null);
+        holder.revalidateCatalog(true);
     }
 
     @Override
@@ -54,7 +55,24 @@ public class MusicBrowserService extends MediaBrowserServiceCompat {
             return null;
         }
         if (TelegramMediaSession.getInstance(this).isPasscodeLocked()) {
+            android.util.Log.w("TgCar", "onGetRoot refused: passcode locked");
             return null;
+        }
+        if (!isSelf) {
+            try {
+                grantUriPermission(clientPackageName, CarArtworkProvider.getBaseUri(),
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
+            } catch (Exception e) {
+                FileLog.e(e);
+            }
+        }
+        if (!isSelf && clientPackageName.startsWith("com.google.android.projection.gearhead")) {
+            TelegramMediaSession.getInstance(this).restoreCarSession();
+        }
+        if (rootHints != null && rootHints.getBoolean(BrowserRoot.EXTRA_RECENT)) {
+            Bundle extras = new Bundle();
+            extras.putBoolean(BrowserRoot.EXTRA_RECENT, true);
+            return new BrowserRoot(TelegramMediaSession.MEDIA_ID_RESUME, extras);
         }
         return new BrowserRoot(MEDIA_ID_ROOT, TelegramMediaSession.getInstance(this).buildRootHints());
     }

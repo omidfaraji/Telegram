@@ -22,6 +22,7 @@ import android.support.v4.media.MediaMetadataCompat;
 import android.support.v4.media.session.MediaSessionCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
 import android.text.TextUtils;
+import android.util.Log;
 import android.util.LruCache;
 
 import androidx.annotation.NonNull;
@@ -130,8 +131,176 @@ public class TelegramMediaSession {
         lastPlayerState = state;
         TelegramMediaSession current = instance;
         if (current != null) {
-            current.session.setPlaybackState(state);
+            current.session.setPlaybackState(current.withFavoriteAction(state));
+            current.rememberPlayState();
         }
+    }
+
+    /** Adds a star button to the car's now-playing screen for the playing item. */
+    private PlaybackStateCompat withFavoriteAction(PlaybackStateCompat state) {
+        MessageObject playing = MediaController.getInstance().getPlayingMessageObject();
+        if (state == null || playing == null || !isCarPlayable(playing)) {
+            return state;
+        }
+        boolean favorite = isFavorite(playing.getDialogId(), playing.getId());
+        PlaybackStateCompat.Builder builder = new PlaybackStateCompat.Builder(state);
+        builder.addCustomAction(new PlaybackStateCompat.CustomAction.Builder(CUSTOM_ACTION_FAVORITE,
+                LocaleController.getString(favorite ? R.string.CarRemoveFavorite : R.string.CarAddFavorite),
+                favorite ? R.drawable.ic_rating_star_filled : R.drawable.ic_rating_star).build());
+        return builder.build();
+    }
+
+    @Nullable
+    private ArrayList<CarPlaybackStore.Favorite> favorites;
+    @Nullable
+    private ArrayList<CarPlaybackStore.Favorite> recents;
+    private int listsAccount = -1;
+
+    private ArrayList<CarPlaybackStore.Favorite> getStoredList(String prefix) {
+        if (listsAccount != currentAccount) {
+            favorites = null;
+            recents = null;
+            listsAccount = currentAccount;
+        }
+        if (MEDIA_ID_RECENT_PREFIX.equals(prefix)) {
+            if (recents == null) {
+                recents = CarPlaybackStore.loadList(CarPlaybackStore.RECENT, currentAccount);
+            }
+            return recents;
+        }
+        if (favorites == null) {
+            favorites = CarPlaybackStore.loadList(CarPlaybackStore.FAVORITES, currentAccount);
+        }
+        return favorites;
+    }
+
+    private ArrayList<CarPlaybackStore.Favorite> getFavorites() {
+        return getStoredList(MEDIA_ID_FAVORITE_PREFIX);
+    }
+
+    private static int indexOf(ArrayList<CarPlaybackStore.Favorite> list, long dialogId, int messageId) {
+        for (int i = 0; i < list.size(); i++) {
+            CarPlaybackStore.Favorite favorite = list.get(i);
+            if (favorite.dialogId == dialogId && favorite.messageId == messageId) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private boolean isFavorite(long dialogId, int messageId) {
+        return indexOf(getFavorites(), dialogId, messageId) >= 0;
+    }
+
+    private void toggleFavorite(MessageObject message) {
+        ArrayList<CarPlaybackStore.Favorite> list = getFavorites();
+        int index = indexOf(list, message.getDialogId(), message.getId());
+        if (index >= 0) {
+            list.remove(index);
+        } else {
+            list.add(0, CarPlaybackStore.createFavorite(message));
+        }
+        CarPlaybackStore.saveList(CarPlaybackStore.FAVORITES, currentAccount, list);
+        notifyBrowseTree(MEDIA_ID_FAVORITES);
+        notifyBrowseTree(MEDIA_ID_RECENT);
+        notifyDialogChanged(message.getDialogId(), true);
+        if (lastPlayerState != null) {
+            session.setPlaybackState(withFavoriteAction(lastPlayerState));
+        }
+    }
+
+    private void clearRecent() {
+        ArrayList<CarPlaybackStore.Favorite> list = getStoredList(MEDIA_ID_RECENT_PREFIX);
+        list.clear();
+        CarPlaybackStore.saveList(CarPlaybackStore.RECENT, currentAccount, list);
+        notifyBrowseTree(MEDIA_ID_RECENT);
+    }
+
+    /** Moves an item to the top of the recently played list. */
+    private void recordRecent(MessageObject message) {
+        if (message == null || message.getId() <= 0 || !isCarPlayable(message)) {
+            return;
+        }
+        ArrayList<CarPlaybackStore.Favorite> list = getStoredList(MEDIA_ID_RECENT_PREFIX);
+        int index = indexOf(list, message.getDialogId(), message.getId());
+        if (index == 0) {
+            return;
+        }
+        if (index > 0) {
+            list.remove(index);
+        }
+        list.add(0, CarPlaybackStore.createFavorite(message));
+        while (list.size() > CarPlaybackStore.MAX_RECENT) {
+            list.remove(list.size() - 1);
+        }
+        CarPlaybackStore.saveList(CarPlaybackStore.RECENT, currentAccount, list);
+        notifyBrowseTree(MEDIA_ID_RECENT);
+    }
+
+    /**
+     * Plays an item of the favorites or recent list. The list is snapshotted so skipping keeps
+     * the original order even though playing reorders the recent list.
+     */
+    private void playFromStoredList(String prefix, long dialogId, int messageId) {
+        ArrayList<CarPlaybackStore.Favorite> list = getStoredList(prefix);
+        int index = indexOf(list, dialogId, messageId);
+        if (index < 0) {
+            reportPlaybackError("Android Auto: item not found");
+            return;
+        }
+        ArrayList<MessageObject> messages = new ArrayList<>();
+        for (CarPlaybackStore.Favorite favorite : list) {
+            messages.add(favorite.message);
+        }
+        playingSnapshot = messages;
+        playingSnapshotQueue = createAudioQueue(messages, prefix);
+        playingSnapshotTitle = LocaleController.getString(MEDIA_ID_RECENT_PREFIX.equals(prefix)
+                ? R.string.CarTabRecent : R.string.CarTabFavorites);
+        playSnapshotItem(index);
+    }
+
+    private void playSnapshotItem(int index) {
+        if (playingSnapshot == null || index < 0 || index >= playingSnapshot.size()) {
+            return;
+        }
+        ArrayList<MessageObject> messages = playingSnapshot;
+        startPlayback(messages, index, playingSnapshotQueue, playingSnapshotTitle);
+        playingSnapshot = messages;
+    }
+
+    private int indexInSnapshot(MessageObject message) {
+        if (playingSnapshot == null || message == null) {
+            return -1;
+        }
+        for (int i = 0; i < playingSnapshot.size(); i++) {
+            MessageObject item = playingSnapshot.get(i);
+            if (item.getDialogId() == message.getDialogId() && item.getId() == message.getId()) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** Favorites or recent list being played, or null when playing from a chat. */
+    @Nullable
+    private ArrayList<MessageObject> playingSnapshot;
+    @Nullable
+    private ArrayList<MediaSessionCompat.QueueItem> playingSnapshotQueue;
+    private String playingSnapshotTitle;
+    private long lastPositionSave;
+
+    private void savePlayingPosition(boolean force) {
+        MessageObject playing = MediaController.getInstance().getPlayingMessageObject();
+        if (playing == null || !isCarPlayable(playing)) {
+            return;
+        }
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (!force && now - lastPositionSave < POSITION_SAVE_INTERVAL_MS) {
+            return;
+        }
+        lastPositionSave = now;
+        CarPlaybackStore.savePosition(playing.currentAccount, playing.getDialogId(), playing.getId(),
+                playing.audioProgress, playing.getDuration());
     }
 
     public static void clearPlayerState() {
@@ -143,7 +312,61 @@ public class TelegramMediaSession {
                     .setState(PlaybackStateCompat.STATE_STOPPED, 0, 0f)
                     .setActions(current.getAvailableActions())
                     .build());
+            current.showLastPlayed();
         }
+    }
+
+    /**
+     * Shows the most recently played item as paused, so the car's media card offers to resume
+     * it instead of just "Tap to open". Pressing play resumes it from the saved position.
+     */
+    private void showLastPlayed() {
+        if (MediaController.getInstance().getPlayingMessageObject() != null) {
+            return;
+        }
+        ArrayList<CarPlaybackStore.Favorite> list = getStoredList(MEDIA_ID_RECENT_PREFIX);
+        if (list.isEmpty() || list.get(0).message == null) {
+            return;
+        }
+        CarPlaybackStore.Favorite last = list.get(0);
+        MessageObject message = last.message;
+        long durationMs = (long) (message.getDuration() * 1000);
+        MediaMetadataCompat.Builder meta = new MediaMetadataCompat.Builder()
+                .putString(MediaMetadataCompat.METADATA_KEY_MEDIA_ID,
+                        MEDIA_ID_RECENT_PREFIX + last.dialogId + "_" + last.messageId)
+                .putString(MediaMetadataCompat.METADATA_KEY_TITLE, getAudioTitle(message))
+                .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, message.getMusicAuthor())
+                .putString(MediaMetadataCompat.METADATA_KEY_ALBUM_ARTIST, message.getMusicAuthor())
+                .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, durationMs);
+        Bitmap cover = getNowPlayingCover(message);
+        if (cover == null) {
+            boolean video = isCarVideo(message);
+            cover = getFallbackCover(video);
+            String uri = getFallbackCoverUri(video).toString();
+            meta.putString(MediaMetadataCompat.METADATA_KEY_ALBUM_ART_URI, uri)
+                    .putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON_URI, uri);
+        }
+        if (cover != null) {
+            meta.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, cover);
+        }
+        session.setMetadata(meta.build());
+        float progress = CarPlaybackStore.getPosition(currentAccount, last.dialogId, last.messageId);
+        long position = progress > 0 ? (long) (progress * durationMs) : 0;
+        session.setPlaybackState(new PlaybackStateCompat.Builder()
+                .setState(PlaybackStateCompat.STATE_PAUSED, position, 0f)
+                .setActions(getAvailableActions() | PlaybackStateCompat.ACTION_PLAY | PlaybackStateCompat.ACTION_PLAY_PAUSE)
+                .build());
+    }
+
+    /** Resumes the most recently played item; returns false when there is none. */
+    private boolean resumeLastPlayed() {
+        ArrayList<CarPlaybackStore.Favorite> list = getStoredList(MEDIA_ID_RECENT_PREFIX);
+        if (list.isEmpty() || list.get(0).message == null) {
+            return false;
+        }
+        CarPlaybackStore.Favorite last = list.get(0);
+        playFromStoredList(MEDIA_ID_RECENT_PREFIX, last.dialogId, last.messageId);
+        return true;
     }
 
     private static final String SESSION_TAG = "TelegramMediaSession";
@@ -160,6 +383,15 @@ public class TelegramMediaSession {
     private static final String MEDIA_ID_VIDEO_LIBRARY = "__VIDEOS__";
     private static final String MEDIA_ID_VIDEO_CHAT_PREFIX = "__VCHAT_";
     private static final String MEDIA_ID_MESSAGE_PREFIX = "msg_";
+    private static final String MEDIA_ID_FAVORITES = "__FAVORITES__";
+    private static final String MEDIA_ID_FAVORITE_PREFIX = "fav_";
+    private static final String MEDIA_ID_RECENT = "__RECENT__";
+    private static final String MEDIA_ID_RECENT_PREFIX = "rec_";
+    private static final String MEDIA_ID_CLEAR_RECENT = "__CLEAR_RECENT__";
+    /** Root offered to system media resumption (BrowserRoot.EXTRA_RECENT): just the last item. */
+    public static final String MEDIA_ID_RESUME = "__RESUME__";
+    private static final String CUSTOM_ACTION_FAVORITE = "org.telegram.messenger.CAR_FAVORITE";
+    private static final long POSITION_SAVE_INTERVAL_MS = 2000;
     private static final String CONTENT_STYLE_SUPPORTED = "android.media.browse.CONTENT_STYLE_SUPPORTED";
     private static final String CONTENT_STYLE_BROWSABLE_HINT = "android.media.browse.CONTENT_STYLE_BROWSABLE_HINT";
     private static final String CONTENT_STYLE_PLAYABLE_HINT = "android.media.browse.CONTENT_STYLE_PLAYABLE_HINT";
@@ -194,6 +426,23 @@ public class TelegramMediaSession {
     private static final int CLOUD_AUDIO_PAGE_SIZE = 100;
     private final LongSparseArray<CloudAudioLoad> cloudAudioLoads = new LongSparseArray<>();
     private final Set<Integer> cloudRequestIds = new HashSet<>();
+    /** Dialogs whose photo/video shared media has been merged into their playable list. */
+    private final Set<Long> videoLoadedDialogs = new HashSet<>();
+    private final LongSparseArray<ArrayList<Runnable>> pendingVideoLoads = new LongSparseArray<>();
+    /** Chats found by the background photo/video scan; round videos are found by the main chat scan. */
+    private final Set<Long> photoVideoDialogs = new HashSet<>();
+    private boolean videoDialogsLoaded;
+    private boolean scanningVideoDialogs;
+    private boolean videoRescanRequested;
+    private final ArrayList<PendingBrowseRequest> pendingVideoBrowseRequests = new ArrayList<>();
+    private boolean chatsReloadRequested;
+    private final LongSparseArray<Integer> discoveredChannelCounts = new LongSparseArray<>();
+    /** Bumped on every deletion so in-flight database reads cannot republish deleted messages. */
+    private int deletionGeneration;
+    private boolean channelRediscoveryRequested;
+    private final LongSparseArray<Runnable> pendingDialogNotifies = new LongSparseArray<>();
+    private static final long DIALOG_NOTIFY_INTERVAL_MS = 1500;
+    private static final long CATALOG_REVALIDATE_DELAY_MS = 1000;
     private long pendingPlayDialog;
     private final Runnable pendingPlayTimeout = () -> {
         if (pendingPlayDialog != 0) {
@@ -220,13 +469,40 @@ public class TelegramMediaSession {
         int filterIndex;
         int offsetId;
         boolean loading;
+        boolean firstPageDone;
+        boolean retryScheduled;
+        /** Pages are fetched until the chat has this many items; browsing deeper raises it. */
+        int target = CLOUD_AUDIO_PAGE_SIZE;
+        final ArrayList<Runnable> waiters = new ArrayList<>();
+        /** Server totals for the music and round/voice filters, -1 while unknown. */
+        final int[] serverCounts = {-1, -1};
+        boolean countsRequested;
+
+        boolean exhausted() {
+            return filterIndex >= 2;
+        }
     }
+
+    private static final int BROWSE_PAGE_SIZE = 25;
+    private static final String PAGE_SEPARATOR = "@";
+    private static final String CAR_LOG_TAG = "TgCar";
+
+    private static final long CLOUD_WAIT_TIMEOUT_MS = 8000;
+    private static final int PREFETCH_DISTANCE = 5;
+
 
     private void cancelCloudAudioRequests() {
         for (int requestId : cloudRequestIds) {
             ConnectionsManager.getInstance(currentAccount).cancelRequest(requestId, true);
         }
         cloudRequestIds.clear();
+        for (int i = 0; i < cloudAudioLoads.size(); i++) {
+            ArrayList<Runnable> waiters = new ArrayList<>(cloudAudioLoads.valueAt(i).waiters);
+            cloudAudioLoads.valueAt(i).waiters.clear();
+            for (Runnable waiter : waiters) {
+                waiter.run();
+            }
+        }
         cloudAudioLoads.clear();
         cloudSearchMessages.clear();
     }
@@ -266,7 +542,21 @@ public class TelegramMediaSession {
         }
         if (lastPlayerState != null) {
             session.setPlaybackState(lastPlayerState);
+        } else {
+            showLastPlayed();
         }
+        try {
+            appContext.getContentResolver().registerContentObserver(CAR_CONNECTION_URI, true,
+                    new android.database.ContentObserver(new android.os.Handler(android.os.Looper.getMainLooper())) {
+                        @Override
+                        public void onChange(boolean selfChange) {
+                            checkCarConnection();
+                        }
+                    });
+        } catch (Exception e) {
+            FileLog.e(e);
+        }
+        checkCarConnection();
 
         updateRepeatMode();
         updateShuffleMode();
@@ -299,10 +589,38 @@ public class TelegramMediaSession {
         pendingAudioLoads.clear();
         audioCounts.clear();
         dialogOrder.clear();
+        pinnedDialogs.clear();
+        videoLoadedDialogs.clear();
+        pendingVideoLoads.clear();
+        photoVideoDialogs.clear();
+        videoDialogsLoaded = false;
+        scanningVideoDialogs = false;
+        videoRescanRequested = false;
+        chatsReloadRequested = false;
+        discoveredChannelCounts.clear();
+        channelRediscoveryRequested = false;
+        sentSignatures.clear();
+        favorites = null;
+        recents = null;
+        playingSnapshot = null;
+        for (int i = 0; i < pendingDialogNotifies.size(); i++) {
+            AndroidUtilities.cancelRunOnUIThread(pendingDialogNotifies.valueAt(i));
+        }
+        pendingDialogNotifies.clear();
+        AndroidUtilities.cancelRunOnUIThread(catalogRevalidate);
+        CarArtworkProvider.clearSources();
+        ArrayList<PendingBrowseRequest> videoRequests = new ArrayList<>(pendingVideoBrowseRequests);
+        pendingVideoBrowseRequests.clear();
+        for (PendingBrowseRequest request : videoRequests) {
+            request.callback.onResult(new ArrayList<>());
+        }
         try {
             session.setQueue(null);
             session.setQueueTitle(null);
         } catch (Throwable ignored) {
+        }
+        if (!pendingBrowseRequests.isEmpty()) {
+            loadChats();
         }
     }
 
@@ -646,55 +964,226 @@ public class TelegramMediaSession {
             loadCloudAudio(dialogId);
             return;
         }
-        loadAudioForDialog(dialogId, onLoaded);
+        loadAudioForDialog(dialogId, onLoaded != null ? guarded(onLoaded) : null);
+    }
+
+    /** Drops a continuation if the account or catalog changed while it was waiting. */
+    private Runnable guarded(Runnable action) {
+        final int account = currentAccount;
+        final int revision = audioCatalogRevision;
+        return () -> {
+            if (account == currentAccount && revision == audioCatalogRevision) {
+                action.run();
+            }
+        };
     }
 
     public void refreshAudioCatalog(Runnable onLoaded) {
-        refreshAudioData(0, onLoaded);
-    }
-
-    public void refreshAudioData(long dialogId, Runnable onLoaded) {
         AndroidUtilities.runOnUIThread(() -> {
-            cancelCloudAudioRequests();
-            audioCatalogRevision++;
-            chatsLoaded = false;
-            dialogs.clear();
-            videoDialogs.clear();
-            users.clear();
-            chats.clear();
-            audioObjects.clear();
-            audioQueues.clear();
-            audioCounts.clear();
-            for (int i = 0; i < pendingAudioLoads.size(); i++) {
-                long pendingDialog = pendingAudioLoads.keyAt(i);
-                ArrayList<Runnable> callbacks = pendingAudioLoads.valueAt(i);
-                pendingCatalogCallbacks.add(() -> loadAudioForDialog(pendingDialog, () -> {
-                    for (Runnable callback : callbacks) {
-                        callback.run();
-                    }
-                }));
-            }
-            pendingAudioLoads.clear();
-            if (dialogId != 0 && onLoaded != null) {
-                pendingCatalogCallbacks.add(() -> loadAudioForDialog(dialogId, onLoaded));
-            } else if (onLoaded != null) {
+            if (onLoaded != null) {
                 pendingCatalogCallbacks.add(onLoaded);
+            }
+            if (loadingChats) {
+                chatsReloadRequested = true;
+                return;
             }
             loadChats();
         });
     }
 
-    public static boolean hasPlayableAudio(ArrayList<MessageObject> messages) {
-        if (messages == null) {
-            return false;
+    private final Runnable catalogRevalidate = () -> refreshAudioCatalog(null);
+
+    /**
+     * Reloads the chat list in the background while the current lists keep being served.
+     * A video rescan is only needed when the car reconnects, because it walks all shared media.
+     */
+    public void revalidateCatalog(boolean rescanVideos) {
+        AndroidUtilities.runOnUIThread(() -> {
+            if (rescanVideos) {
+                requestVideoRescan();
+                dropCachedChatContents();
+            }
+            AndroidUtilities.cancelRunOnUIThread(catalogRevalidate);
+            catalogRevalidate.run();
+        });
+    }
+
+    /**
+     * Observers are detached while the car is away, so cached chat contents may be stale on
+     * reconnect. They are dropped and re-read lazily; the playing chat is reloaded in place.
+     */
+    private void dropCachedChatContents() {
+        channelRediscoveryRequested = true;
+        deletionGeneration++;
+        for (int i = audioObjects.size() - 1; i >= 0; i--) {
+            long did = audioObjects.keyAt(i);
+            if (did == lastSelectedDialog || did == pendingPlayDialog || pendingAudioLoads.get(did) != null) {
+                continue;
+            }
+            audioObjects.removeAt(i);
+            audioQueues.remove(did);
+            videoLoadedDialogs.remove(did);
         }
-        for (MessageObject message : messages) {
-            if (isCarPlayable(message)) {
-                return true;
+        for (int i = cloudAudioLoads.size() - 1; i >= 0; i--) {
+            if (!cloudAudioLoads.valueAt(i).loading) {
+                cloudAudioLoads.removeAt(i);
             }
         }
-        return false;
+        invalidateSearchIndex();
+        if (lastSelectedDialog != 0 && audioObjects.get(lastSelectedDialog) != null) {
+            reloadDialog(lastSelectedDialog);
+        }
     }
+
+    private void scheduleCatalogRevalidate() {
+        AndroidUtilities.cancelRunOnUIThread(catalogRevalidate);
+        AndroidUtilities.runOnUIThread(catalogRevalidate, CATALOG_REVALIDATE_DELAY_MS);
+    }
+
+    private void requestVideoRescan() {
+        if (videoDialogsLoaded) {
+            videoRescanRequested = true;
+        }
+    }
+
+    private void invalidateSearchIndex() {
+        searchIndex = null;
+        searchIndexRevision = -1;
+    }
+
+    /** Notifies the car that a chat's items changed, at most once per interval unless immediate. */
+    private void notifyDialogChanged(long did, boolean immediate) {
+        Runnable pending = pendingDialogNotifies.get(did);
+        if (pending != null) {
+            if (!immediate) {
+                return;
+            }
+            AndroidUtilities.cancelRunOnUIThread(pending);
+            pendingDialogNotifies.remove(did);
+        }
+        Runnable flush = () -> {
+            pendingDialogNotifies.remove(did);
+            if (lastSelectedDialog == did && audioQueues.get(did) != null) {
+                session.setQueue(audioQueues.get(did));
+            }
+            notifyBrowseTree(MEDIA_ID_CHAT_PREFIX + did);
+            notifyBrowseTree(MEDIA_ID_VIDEO_CHAT_PREFIX + did);
+        };
+        if (immediate) {
+            flush.run();
+        } else {
+            pendingDialogNotifies.put(did, flush);
+            AndroidUtilities.runOnUIThread(flush, DIALOG_NOTIFY_INTERVAL_MS);
+        }
+    }
+
+    private void onNewMessages(long did, ArrayList<MessageObject> incoming) {
+        if (!chatsLoaded || DialogObject.isEncryptedDialog(did)) {
+            return;
+        }
+        ArrayList<MessageObject> playable = new ArrayList<>();
+        boolean hasAudio = false;
+        boolean hasVideo = false;
+        for (MessageObject message : incoming) {
+            if (message.getId() > 0 && isCarPlayable(message)) {
+                playable.add(message);
+                if (isCarVideo(message)) {
+                    hasVideo = true;
+                } else {
+                    hasAudio = true;
+                }
+            }
+        }
+        if (playable.isEmpty()) {
+            return;
+        }
+        invalidateSearchIndex();
+        ArrayList<MessageObject> messages = audioObjects.get(did);
+        if (messages != null) {
+            Set<Integer> known = new HashSet<>();
+            for (MessageObject message : messages) {
+                known.add(message.getId());
+            }
+            boolean changed = false;
+            for (MessageObject message : playable) {
+                boolean videoReady = !isCarVideo(message) || message.isRoundVideo() || videoLoadedDialogs.contains(did);
+                if (videoReady && known.add(message.getId())) {
+                    messages.add(0, message);
+                    changed = true;
+                }
+            }
+            if (changed) {
+                audioQueues.put(did, createAudioQueue(did, messages));
+                notifyDialogChanged(did, true);
+            }
+        }
+        if (hasAudio && !dialogs.contains(did)) {
+            dialogs.add(did);
+            sortAudioDialogs();
+            notifyBrowseTree(MEDIA_ID_LIBRARY);
+        }
+        if (hasVideo && videoDialogsLoaded && photoVideoDialogs.add(did)) {
+            rebuildVideoDialogs();
+            notifyBrowseTree(MEDIA_ID_VIDEO_LIBRARY);
+        }
+    }
+
+    /** Removes deleted messages from loaded lists; dialogId 0 means every non-channel chat. */
+    private void onMessagesDeleted(long dialogId, Set<Integer> ids, int maxId) {
+        deletionGeneration++;
+        requestVideoRescan();
+        for (int i = 0; i < audioObjects.size(); i++) {
+            long did = audioObjects.keyAt(i);
+            if (dialogId != 0 ? did != dialogId : isChannelDialog(did)) {
+                continue;
+            }
+            ArrayList<MessageObject> messages = audioObjects.valueAt(i);
+            boolean changed = false;
+            for (int a = messages.size() - 1; a >= 0; a--) {
+                int id = messages.get(a).getId();
+                if (ids != null ? ids.contains(id) : id <= maxId) {
+                    messages.remove(a);
+                    changed = true;
+                }
+            }
+            if (changed) {
+                audioQueues.put(did, createAudioQueue(did, messages));
+                invalidateSearchIndex();
+                notifyDialogChanged(did, true);
+            }
+        }
+        scheduleCatalogRevalidate();
+    }
+
+    private boolean isChannelDialog(long did) {
+        if (!DialogObject.isChatDialog(did)) {
+            return false;
+        }
+        TLRPC.Chat chat = MessagesController.getInstance(currentAccount).getChat(-did);
+        if (chat == null) {
+            chat = chats.get(-did);
+        }
+        return ChatObject.isChannel(chat);
+    }
+
+    private void onDialogRemoved(long did) {
+        deletionGeneration++;
+        if (audioObjects.get(did) != null) {
+            audioObjects.put(did, new ArrayList<>());
+            audioQueues.put(did, new ArrayList<>());
+            notifyDialogChanged(did, true);
+        }
+        invalidateSearchIndex();
+        if (dialogs.remove(did)) {
+            notifyBrowseTree(MEDIA_ID_LIBRARY);
+        }
+        photoVideoDialogs.remove(did);
+        if (videoDialogs.remove(did)) {
+            notifyBrowseTree(MEDIA_ID_VIDEO_LIBRARY);
+        }
+        scheduleCatalogRevalidate();
+    }
+
 
     public interface BrowseTreeListener {
         void onChildrenChanged(String parentMediaId);
@@ -704,18 +1193,45 @@ public class TelegramMediaSession {
     private static BrowseTreeListener browseTreeListener;
     private int observedAccount = -1;
     private final NotificationCenter.NotificationCenterDelegate messageObserver = (id, account, args) -> {
-        if (id == NotificationCenter.didReceiveNewMessages) {
+        if (id == NotificationCenter.messagePlayingProgressDidChanged) {
+            savePlayingPosition(false);
+        } else if (id == NotificationCenter.messagePlayingPlayStateChanged) {
+            savePlayingPosition(true);
+        } else if (id == NotificationCenter.messagePlayingDidStart) {
+            if (args.length > 0 && args[0] instanceof MessageObject) {
+                recordRecent((MessageObject) args[0]);
+            }
+        } else if (id == NotificationCenter.didReceiveNewMessages) {
             if (args.length > 1 && args[0] instanceof Long && args[1] instanceof ArrayList
                     && (args.length <= 2 || !Boolean.TRUE.equals(args[2]))) {
                 @SuppressWarnings("unchecked")
                 ArrayList<MessageObject> messages = (ArrayList<MessageObject>) args[1];
-                if (hasPlayableAudio(messages)) {
-                    long dialogId = (Long) args[0];
-                    refreshAudioData(dialogId, () -> {
-                        notifyBrowseTree(MEDIA_ID_CHAT_PREFIX + dialogId);
-                        notifyBrowseTree(MEDIA_ID_VIDEO_CHAT_PREFIX + dialogId);
-                    });
+                onNewMessages((Long) args[0], messages);
+            }
+        } else if (id == NotificationCenter.messagesDeleted) {
+            if (args.length > 1 && args[0] instanceof ArrayList && args[1] instanceof Long
+                    && (args.length <= 2 || !Boolean.TRUE.equals(args[2]))) {
+                Set<Integer> ids = new HashSet<>();
+                for (Object object : (ArrayList<?>) args[0]) {
+                    if (object instanceof Integer) {
+                        ids.add((Integer) object);
+                    }
                 }
+                long channelId = (Long) args[1];
+                onMessagesDeleted(channelId != 0 ? -channelId : 0, ids, 0);
+            }
+        } else if (id == NotificationCenter.historyCleared) {
+            if (args.length > 1 && args[0] instanceof Long && args[1] instanceof Integer) {
+                onMessagesDeleted((Long) args[0], null, (Integer) args[1]);
+            }
+        } else if (id == NotificationCenter.dialogDeleted) {
+            if (args.length > 0 && args[0] instanceof Long) {
+                onDialogRemoved((Long) args[0]);
+            }
+        } else if (id == NotificationCenter.removeAllMessagesFromDialog) {
+            // Also posted when Telegram resyncs a chat, so reload it instead of emptying it.
+            if (args.length > 0 && args[0] instanceof Long) {
+                reloadDialog((Long) args[0]);
             }
         } else if (id == NotificationCenter.dialogsNeedReload) {
             applyLiveDialogOrder();
@@ -727,12 +1243,6 @@ public class TelegramMediaSession {
             if ((mask & chatMask) != 0) {
                 scheduleChatListRefresh();
             }
-        } else if (id == NotificationCenter.fileLoaded) {
-            if (args.length > 0 && args[0] instanceof String && this.requestedAvatars.remove(args[0])) {
-                scheduleChatListRefresh();
-            }
-        } else {
-            refreshAudioCatalog(null);
         }
     };
 
@@ -800,7 +1310,136 @@ public class TelegramMediaSession {
     /** Registers the connected media browser so the audio tree refreshes as messages change. */
     public void setBrowseTreeListener(@Nullable BrowseTreeListener listener) {
         browseTreeListener = listener;
+        if (listener == null) {
+            // A pause caused by the car disconnecting must not be remembered as the user's choice.
+            AndroidUtilities.cancelRunOnUIThread(savePausedState);
+            carSessionRestored = false;
+        }
         updateMessageObservers();
+    }
+
+    /**
+     * Pauses are stored with a delay: disconnecting from the car pauses playback too, and that
+     * pause is dropped when the car goes away first, so the next connection resumes playing.
+     */
+    private static final long PAUSE_STATE_DELAY_MS = 5000;
+    private final Runnable savePausedState = () -> {
+        boolean connected = isCarConnected();
+        Log.d(CAR_LOG_TAG, "paused state: car connected=" + connected);
+        if (connected) {
+            CarPlaybackStore.setWasPlaying(currentAccount, false);
+        }
+    };
+
+    private static final Uri CAR_CONNECTION_URI = Uri.parse("content://androidx.car.app.connection");
+
+    /** Asks Android Auto whether a car is connected, like androidx.car.app.connection.CarConnection. */
+    private boolean isCarConnected() {
+        try (android.database.Cursor cursor = appContext.getContentResolver().query(CAR_CONNECTION_URI,
+                new String[]{"CarConnectionState"}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                return cursor.getInt(0) != 0;
+            }
+        } catch (Exception e) {
+            FileLog.e(e);
+        }
+        return false;
+    }
+    private boolean carSessionRestored;
+    @Nullable
+    private Boolean lastRememberedPaused;
+    private boolean carConnected;
+    private long carConnectedAt;
+    /** Set on car connect when playback was paused last time; swallows Android Auto's autoplay. */
+    private boolean blockAutoplay;
+    private int autoplayBlocked;
+    // Android Auto retries its autoplay a few seconds later when playback did not start.
+    private static final long AUTOPLAY_WINDOW_MS = 12000;
+    private static final int MAX_AUTOPLAY_RETRIES = 3;
+
+    private void checkCarConnection() {
+        boolean connected = isCarConnected();
+        if (connected == carConnected) {
+            return;
+        }
+        carConnected = connected;
+        Log.d(CAR_LOG_TAG, "car connected=" + connected);
+        if (connected) {
+            carConnectedAt = SystemClock.elapsedRealtime();
+            restoreCarSession();
+        } else {
+            AndroidUtilities.cancelRunOnUIThread(savePausedState);
+            carSessionRestored = false;
+            blockAutoplay = false;
+        }
+    }
+
+    /**
+     * Android Auto's "start media automatically" option plays the last media app on connect.
+     * When playback was paused at the end of the last drive, that first automatic play is
+     * ignored so the item stays paused.
+     */
+    private boolean consumeAutoplay() {
+        if (!blockAutoplay) {
+            return false;
+        }
+        if (SystemClock.elapsedRealtime() - carConnectedAt > AUTOPLAY_WINDOW_MS || ++autoplayBlocked > MAX_AUTOPLAY_RETRIES) {
+            blockAutoplay = false;
+            return false;
+        }
+        Log.d(CAR_LOG_TAG, "ignoring automatic play on connect; last state was paused");
+        if (MediaController.getInstance().getPlayingMessageObject() == null) {
+            showLastPlayed();
+        } else if (lastPlayerState != null) {
+            session.setPlaybackState(withFavoriteAction(lastPlayerState));
+        }
+        return true;
+    }
+
+    private void rememberPlayState() {
+        MessageObject playing = MediaController.getInstance().getPlayingMessageObject();
+        if (playing == null) {
+            return;
+        }
+        boolean paused = MediaController.getInstance().isMessagePaused();
+        if (Boolean.valueOf(paused).equals(lastRememberedPaused)) {
+            return;
+        }
+        lastRememberedPaused = paused;
+        AndroidUtilities.cancelRunOnUIThread(savePausedState);
+        if (paused) {
+            AndroidUtilities.runOnUIThread(savePausedState, PAUSE_STATE_DELAY_MS);
+        } else {
+            CarPlaybackStore.setWasPlaying(currentAccount, true);
+        }
+    }
+
+    /**
+     * Called when the car connects: resumes the last item if it was playing at the end of the
+     * previous drive, otherwise shows it paused on the media card.
+     */
+    public void restoreCarSession() {
+        if (carSessionRestored) {
+            return;
+        }
+        carSessionRestored = true;
+        boolean wasPlaying = CarPlaybackStore.wasPlaying(currentAccount);
+        blockAutoplay = !wasPlaying;
+        autoplayBlocked = 0;
+        carConnectedAt = SystemClock.elapsedRealtime();
+        Log.d(CAR_LOG_TAG, "restoring car session, was playing=" + wasPlaying);
+        if (MediaController.getInstance().getPlayingMessageObject() != null) {
+            return;
+        }
+        if (wasPlaying) {
+            AndroidUtilities.runOnUIThread(() -> {
+                if (MediaController.getInstance().getPlayingMessageObject() == null && !resumeLastPlayed()) {
+                    showLastPlayed();
+                }
+            }, 1000);
+        } else {
+            showLastPlayed();
+        }
     }
 
     private void updateMessageObservers() {
@@ -810,7 +1449,8 @@ public class TelegramMediaSession {
         }
         int[] events = {NotificationCenter.didReceiveNewMessages, NotificationCenter.messagesDeleted, NotificationCenter.historyCleared,
                 NotificationCenter.dialogsNeedReload, NotificationCenter.updateInterfaces, NotificationCenter.dialogDeleted,
-                NotificationCenter.removeAllMessagesFromDialog, NotificationCenter.fileLoaded};
+                NotificationCenter.removeAllMessagesFromDialog, NotificationCenter.messagePlayingProgressDidChanged,
+                NotificationCenter.messagePlayingPlayStateChanged, NotificationCenter.messagePlayingDidStart};
         if (observedAccount >= 0) {
             for (int event : events) {
                 NotificationCenter.getInstance(observedAccount).removeObserver(messageObserver, event);
@@ -825,10 +1465,53 @@ public class TelegramMediaSession {
     }
 
     private static void notifyBrowseTree(String parentMediaId) {
-        BrowseTreeListener listener = browseTreeListener;
-        if (listener != null) {
-            listener.onChildrenChanged(parentMediaId);
+        notifyIfChanged(parentMediaId);
+        // Pages of a list are separate browse nodes; refresh the ones the car has opened.
+        TelegramMediaSession instance = peekInstance();
+        if (instance != null) {
+            String pagePrefix = parentMediaId + PAGE_SEPARATOR;
+            for (String sent : new ArrayList<>(instance.sentSignatures.keySet())) {
+                if (sent.startsWith(pagePrefix)) {
+                    notifyIfChanged(sent);
+                }
+            }
         }
+    }
+
+    /**
+     * The car reloads a list and resets its scroll position on every change notification, so a
+     * list is only refreshed when the rows it was last given actually differ.
+     */
+    private static void notifyIfChanged(String parentMediaId) {
+        BrowseTreeListener listener = browseTreeListener;
+        if (listener == null) {
+            return;
+        }
+        TelegramMediaSession instance = peekInstance();
+        if (instance != null) {
+            String sent = instance.sentSignatures.get(parentMediaId);
+            if (sent != null && sent.equals(signatureOf(instance.loadChildrenSync(parentMediaId)))) {
+                return;
+            }
+        }
+        listener.onChildrenChanged(parentMediaId);
+    }
+
+    private final HashMap<String, String> sentSignatures = new HashMap<>();
+
+    private static String signatureOf(@Nullable List<MediaBrowser.MediaItem> items) {
+        if (items == null) {
+            return "";
+        }
+        StringBuilder builder = new StringBuilder();
+        for (MediaBrowser.MediaItem item : items) {
+            android.media.MediaDescription description = item.getDescription();
+            builder.append(description.getMediaId()).append('\u0001')
+                    .append(description.getTitle()).append('\u0001')
+                    .append(description.getSubtitle()).append('\u0001')
+                    .append(description.getIconUri()).append('\u0002');
+        }
+        return builder.toString();
     }
 
     public static boolean isCarPlayable(MessageObject messageObject) {
@@ -924,8 +1607,51 @@ public class TelegramMediaSession {
 
     private final ArrayList<PendingBrowseRequest> pendingBrowseRequests = new ArrayList<>();
 
+    /**
+     * The car shows a spinner until a list is answered and does not retry by itself, so a list
+     * that is still loading (e.g. while Telegram's database is busy right after start) is
+     * answered with what is known after this delay and refreshed once the real result arrives.
+     */
+    private static final long BROWSE_ANSWER_TIMEOUT_MS = 4000;
+
     public void loadBrowseChildren(String parentMediaId, BrowseChildrenCallback callback) {
-        if (MEDIA_ID_ROOT.equals(parentMediaId)) {
+        final long start = SystemClock.elapsedRealtime();
+        final boolean[] answered = new boolean[1];
+        Runnable timeout = () -> {
+            if (answered[0]) {
+                return;
+            }
+            answered[0] = true;
+            List<MediaBrowser.MediaItem> items = loadChildrenSync(parentMediaId);
+            Log.w(CAR_LOG_TAG, "browse " + parentMediaId + " timed out, answering " + items.size() + " known items");
+            sentSignatures.put(parentMediaId, signatureOf(items));
+            callback.onResult(items);
+        };
+        AndroidUtilities.runOnUIThread(timeout, BROWSE_ANSWER_TIMEOUT_MS);
+        loadBrowseChildrenInternal(parentMediaId, items -> {
+            AndroidUtilities.cancelRunOnUIThread(timeout);
+            if (answered[0]) {
+                // The car already got a provisional list; refresh it if the real one differs.
+                notifyIfChanged(parentMediaId);
+                return;
+            }
+            answered[0] = true;
+            if (items != null) {
+                sentSignatures.put(parentMediaId, signatureOf(items));
+            } else {
+                sentSignatures.remove(parentMediaId);
+            }
+            if (BuildVars.LOGS_ENABLED) {
+                Log.d(CAR_LOG_TAG, "browse " + parentMediaId + " answered " + (items != null ? items.size() : -1)
+                        + " items in " + (SystemClock.elapsedRealtime() - start) + "ms");
+            }
+            callback.onResult(items);
+        });
+    }
+
+    private void loadBrowseChildrenInternal(String parentMediaId, BrowseChildrenCallback callback) {
+        if (MEDIA_ID_ROOT.equals(parentMediaId) || MEDIA_ID_RESUME.equals(parentMediaId) || parentMediaId.startsWith(MEDIA_ID_FAVORITES)
+                || parentMediaId.startsWith(MEDIA_ID_RECENT)) {
             callback.onResult(loadChildrenSync(parentMediaId));
             return;
         }
@@ -937,14 +1663,83 @@ public class TelegramMediaSession {
 
         long did = getDialogIdFromMediaId(parentMediaId);
         if (did != 0 && audioObjects.get(did) == null) {
-            loadAudioForDialog(did, () -> callback.onResult(loadChildrenSync(parentMediaId)));
+            loadAudioForDialog(did, () -> {
+                if (audioObjects.get(did) == null) {
+                    callback.onResult(loadChildrenSync(parentMediaId));
+                } else {
+                    loadBrowseChildren(parentMediaId, callback);
+                }
+            });
+            return;
+        }
+        if (did != 0 && parentMediaId.startsWith(MEDIA_ID_VIDEO_CHAT_PREFIX) && !videoLoadedDialogs.contains(did)) {
+            loadVideosForDialog(did, () -> callback.onResult(loadChildrenSync(parentMediaId)));
+            return;
+        }
+        if (parentMediaId.startsWith(MEDIA_ID_VIDEO_LIBRARY) && !videoDialogsLoaded) {
+            pendingVideoBrowseRequests.add(new PendingBrowseRequest(parentMediaId, callback));
+            scanVideoDialogs();
             return;
         }
 
-        callback.onResult(loadChildrenSync(parentMediaId));
         if (did != 0) {
-            loadCloudAudio(did);
+            int offset = getPageOffset(parentMediaId);
+            if (!parentMediaId.startsWith(MEDIA_ID_VIDEO_CHAT_PREFIX)) {
+                // One extra item tells whether an "older" folder is needed.
+                ensureCloudItems(did, offset + BROWSE_PAGE_SIZE + 1,
+                        () -> callback.onResult(loadChildrenSync(parentMediaId)),
+                        () -> callback.onResult(new ArrayList<>()));
+                return;
+            }
         }
+        callback.onResult(loadChildrenSync(parentMediaId));
+    }
+
+    /**
+     * Fetches server pages until the chat holds at least {@code needed} items, the server is
+     * exhausted, or a timeout passes. Browsing is never blocked longer than the timeout.
+     */
+    private void ensureCloudItems(long did, int needed, Runnable onReady, @Nullable Runnable onCancelled) {
+        ArrayList<MessageObject> messages = audioObjects.get(did);
+        if (messages == null || DialogObject.isEncryptedDialog(did)) {
+            onReady.run();
+            return;
+        }
+        CloudAudioLoad load = cloudAudioLoads.get(did);
+        if (load == null) {
+            load = new CloudAudioLoad();
+            cloudAudioLoads.put(did, load);
+        }
+        load.target = Math.max(load.target, needed);
+        if (load.exhausted() || load.firstPageDone && messages.size() >= needed) {
+            onReady.run();
+            loadCloudAudio(did);
+            return;
+        }
+        final CloudAudioLoad state = load;
+        final int account = currentAccount;
+        final class Waiter implements Runnable {
+            private boolean done;
+
+            @Override
+            public void run() {
+                if (done) {
+                    return;
+                }
+                done = true;
+                state.waiters.remove(this);
+                AndroidUtilities.cancelRunOnUIThread(this);
+                if (account == currentAccount) {
+                    onReady.run();
+                } else if (onCancelled != null) {
+                    onCancelled.run();
+                }
+            }
+        }
+        Waiter waiter = new Waiter();
+        state.waiters.add(waiter);
+        AndroidUtilities.runOnUIThread(waiter, CLOUD_WAIT_TIMEOUT_MS);
+        loadCloudAudio(did);
     }
 
     /** Orders chats like Telegram's chat list: pinned chats first, then by last message date. */
@@ -982,9 +1777,6 @@ public class TelegramMediaSession {
         MessagesStorage messagesStorage = MessagesStorage.getInstance(account);
         messagesStorage.getStorageQueue().postRunnable(() -> {
             ArrayList<Long> loadedDialogs = new ArrayList<>();
-            ArrayList<Long> loadedVideoDialogs = new ArrayList<>();
-            Set<Long> loadedVideoDialogIds = new HashSet<>();
-            Set<Long> loadedDialogIds = new HashSet<>();
             LongSparseArray<Integer> loadedAudioCounts = new LongSparseArray<>();
             LongSparseArray<TLRPC.User> loadedUsers = new LongSparseArray<>();
             LongSparseArray<TLRPC.Chat> loadedChats = new LongSparseArray<>();
@@ -995,14 +1787,16 @@ public class TelegramMediaSession {
             try {
                 ArrayList<Long> usersToLoad = new ArrayList<>();
                 ArrayList<Long> chatsToLoad = new ArrayList<>();
-                SQLiteCursor cursor = messagesStorage.getDatabase().queryFinalized(String.format(Locale.US, "SELECT uid, COUNT(*) FROM media_v4 WHERE uid != 0 AND mid > 0 AND type = %d GROUP BY uid", MediaDataController.MEDIA_MUSIC));
+                // Counting rows avoids deserializing every voice message; videos are found later by scanVideoDialogs.
+                SQLiteCursor cursor = messagesStorage.getDatabase().queryFinalized(String.format(Locale.US,
+                        "SELECT uid, COUNT(*) FROM media_v4 WHERE uid != 0 AND mid > 0 AND type IN (%d, %d) GROUP BY uid",
+                        MediaDataController.MEDIA_MUSIC, MediaDataController.MEDIA_AUDIO));
                 while (cursor.next()) {
                     long dialogId = cursor.longValue(0);
                     if (DialogObject.isEncryptedDialog(dialogId)) {
                         continue;
                     }
                     loadedDialogs.add(dialogId);
-                    loadedDialogIds.add(dialogId);
                     loadedAudioCounts.put(dialogId, cursor.intValue(1));
                     if (DialogObject.isUserDialog(dialogId)) {
                         usersToLoad.add(dialogId);
@@ -1012,72 +1806,7 @@ public class TelegramMediaSession {
                 }
                 cursor.dispose();
 
-                LongSparseArray<Integer> voiceCounts = new LongSparseArray<>();
-                cursor = messagesStorage.getDatabase().queryFinalized(String.format(Locale.US, "SELECT data, mid, uid FROM media_v4 WHERE uid != 0 AND mid > 0 AND type IN (%d, %d)", MediaDataController.MEDIA_AUDIO, MediaDataController.MEDIA_PHOTOVIDEO));
-                while (cursor.next()) {
-                    long dialogId = cursor.longValue(2);
-                    if (DialogObject.isEncryptedDialog(dialogId)) {
-                        continue;
-                    }
-                    NativeByteBuffer data = cursor.byteBufferValue(0);
-                    if (data == null) {
-                        continue;
-                    }
-                    TLRPC.Message message = TLRPC.Message.TLdeserialize(data, data.readInt32(false), false);
-                    if (message == null) {
-                        data.reuse();
-                        continue;
-                    }
-                    message.readAttachPath(data, UserConfig.getInstance(account).clientUserId);
-                    data.reuse();
-                    if (message.media instanceof TLRPC.TL_messageMediaPhoto
-                            || !MessageObject.isVoiceMessage(message)
-                            && !MessageObject.isRoundVideoMessage(message)
-                            && !MessageObject.isVideoMessage(message)) {
-                        continue;
-                    }
-
-                    message.id = cursor.intValue(1);
-                    message.dialog_id = dialogId;
-                    MessageObject messageObject = new MessageObject(account, message, false, true);
-                    if (!isCarPlayable(messageObject)) {
-                        continue;
-                    }
-                    if (isCarVideo(messageObject)) {
-                        if (loadedVideoDialogIds.add(dialogId)) {
-                            loadedVideoDialogs.add(dialogId);
-                            if (!loadedDialogIds.contains(dialogId)) {
-                                if (DialogObject.isUserDialog(dialogId)) {
-                                    usersToLoad.add(dialogId);
-                                } else {
-                                    chatsToLoad.add(-dialogId);
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    Integer voiceCount = voiceCounts.get(dialogId);
-                    voiceCounts.put(dialogId, voiceCount == null ? 1 : voiceCount + 1);
-                    if (loadedDialogIds.add(dialogId)) {
-                        loadedDialogs.add(dialogId);
-                        if (loadedVideoDialogIds.contains(dialogId)) {
-                            // Already queued for loading by a video in the same chat.
-                        } else if (DialogObject.isUserDialog(dialogId)) {
-                            usersToLoad.add(dialogId);
-                        } else {
-                            chatsToLoad.add(-dialogId);
-                        }
-                    }
-                }
-                cursor.dispose();
-                for (int i = 0; i < voiceCounts.size(); i++) {
-                    long dialogId = voiceCounts.keyAt(i);
-                    Integer musicCount = loadedAudioCounts.get(dialogId);
-                    loadedAudioCounts.put(dialogId, (musicCount != null ? musicCount : 0) + voiceCounts.valueAt(i));
-                }
-
                 sortByChatListOrder(messagesStorage, loadedDialogs);
-                sortByChatListOrder(messagesStorage, loadedVideoDialogs);
 
                 if (!usersToLoad.isEmpty()) {
                     ArrayList<TLRPC.User> usersArrayList = new ArrayList<>();
@@ -1134,11 +1863,14 @@ public class TelegramMediaSession {
                 }
                 if (!succeeded) {
                     loadingChats = false;
-                    chatsLoaded = false;
                     ArrayList<PendingBrowseRequest> requests = new ArrayList<>(pendingBrowseRequests);
                     pendingBrowseRequests.clear();
                     for (PendingBrowseRequest request : requests) {
-                        request.callback.onResult(null);
+                        if (chatsLoaded) {
+                            loadBrowseChildren(request.parentMediaId, request.callback);
+                        } else {
+                            request.callback.onResult(null);
+                        }
                     }
                     ArrayList<Runnable> callbacks = new ArrayList<>(pendingCatalogCallbacks);
                     pendingCatalogCallbacks.clear();
@@ -1147,13 +1879,23 @@ public class TelegramMediaSession {
                     }
                     return;
                 }
+                ArrayList<Long> oldDialogs = new ArrayList<>(dialogs);
+                ArrayList<Long> oldVideoDialogs = new ArrayList<>(videoDialogs);
+                Set<Long> oldPinned = new HashSet<>(pinnedDialogs);
+                boolean firstLoad = !chatsLoaded;
                 dialogs.clear();
                 dialogs.addAll(loadedDialogs);
-                videoDialogs.clear();
-                videoDialogs.addAll(loadedVideoDialogs);
                 audioCounts.clear();
                 for (int i = 0; i < loadedAudioCounts.size(); i++) {
                     audioCounts.put(loadedAudioCounts.keyAt(i), loadedAudioCounts.valueAt(i));
+                }
+                // Keep channels found through server counters so a reload does not hide them until rediscovered.
+                for (long channelDid : channelDialogs) {
+                    Integer discovered = discoveredChannelCounts.get(channelDid);
+                    if (discovered != null && discovered > 0 && !dialogs.contains(channelDid)) {
+                        dialogs.add(channelDid);
+                        audioCounts.put(channelDid, discovered);
+                    }
                 }
                 users.clear();
                 for (int i = 0; i < loadedUsers.size(); i++) {
@@ -1171,6 +1913,8 @@ public class TelegramMediaSession {
                 }
                 pinnedDialogs.clear();
                 pinnedDialogs.addAll(loadedPinned);
+                sortAudioDialogs();
+                sortByDialogOrder(videoDialogs);
                 applyLiveDialogOrder();
                 ArrayList<TLRPC.User> cachedUsers = new ArrayList<>();
                 for (int i = 0; i < loadedUsers.size(); i++) {
@@ -1178,9 +1922,16 @@ public class TelegramMediaSession {
                 }
                 MessagesController.getInstance(account).putUsers(cachedUsers, true);
                 MessagesController.getInstance(account).putChats(toChatList(loadedChats), true);
-                discoverChannelAudio(channelDialogs, 0, account, revision);
-                notifyBrowseTree(MEDIA_ID_LIBRARY);
-                notifyBrowseTree(MEDIA_ID_VIDEO_LIBRARY);
+                boolean rediscover = channelRediscoveryRequested;
+                channelRediscoveryRequested = false;
+                discoverChannelAudio(channelDialogs, 0, account, revision, rediscover);
+                boolean pinsChanged = !oldPinned.equals(pinnedDialogs);
+                if (firstLoad || pinsChanged || !oldDialogs.equals(dialogs)) {
+                    notifyBrowseTree(MEDIA_ID_LIBRARY);
+                }
+                if (videoDialogsLoaded && (pinsChanged || !oldVideoDialogs.equals(videoDialogs))) {
+                    notifyBrowseTree(MEDIA_ID_VIDEO_LIBRARY);
+                }
                 if (lastSelectedDialog == 0 && !dialogs.isEmpty()) {
                     lastSelectedDialog = dialogs.get(0);
                 }
@@ -1196,8 +1947,278 @@ public class TelegramMediaSession {
                 for (Runnable callback : callbacks) {
                     callback.run();
                 }
+                if (!videoDialogsLoaded || videoRescanRequested) {
+                    scanVideoDialogs();
+                }
+                if (chatsReloadRequested) {
+                    chatsReloadRequested = false;
+                    loadChats();
+                }
             });
         });
+    }
+
+    private void rebuildVideoDialogs() {
+        videoDialogs.clear();
+        videoDialogs.addAll(photoVideoDialogs);
+        sortByDialogOrder(videoDialogs);
+    }
+
+    /**
+     * Finds chats with playable videos one chat per storage task, so opening a chat is not queued
+     * behind a scan of every cached photo.
+     */
+    private void scanVideoDialogs() {
+        if (scanningVideoDialogs) {
+            videoRescanRequested = true;
+            return;
+        }
+        scanningVideoDialogs = true;
+        videoRescanRequested = false;
+        final int account = currentAccount;
+        final int revision = audioCatalogRevision;
+        MessagesStorage storage = MessagesStorage.getInstance(account);
+        storage.getStorageQueue().postRunnable(() -> {
+            ArrayList<Long> candidates = new ArrayList<>();
+            try {
+                SQLiteCursor cursor = storage.getDatabase().queryFinalized(String.format(Locale.US,
+                        "SELECT DISTINCT uid FROM media_v4 WHERE uid != 0 AND mid > 0 AND type IN (%d, %d)",
+                        MediaDataController.MEDIA_PHOTOVIDEO, MediaDataController.MEDIA_AUDIO));
+                while (cursor.next()) {
+                    long did = cursor.longValue(0);
+                    if (!DialogObject.isEncryptedDialog(did)) {
+                        candidates.add(did);
+                    }
+                }
+                cursor.dispose();
+            } catch (Exception e) {
+                FileLog.e(e);
+            }
+            scanVideoDialogsStep(storage, account, revision, candidates, 0, new HashSet<>());
+        });
+    }
+
+    private void scanVideoDialogsStep(MessagesStorage storage, int account, int revision, ArrayList<Long> candidates,
+                                      int index, Set<Long> found) {
+        if (index < candidates.size()) {
+            long did = candidates.get(index);
+            if (!readCarMessages(storage, account, did, VIDEO_TYPES, true, true).isEmpty()) {
+                found.add(did);
+            }
+            storage.getStorageQueue().postRunnable(() -> scanVideoDialogsStep(storage, account, revision, candidates, index + 1, found));
+            return;
+        }
+        LongSparseArray<TLRPC.User> loadedUsers = new LongSparseArray<>();
+        LongSparseArray<TLRPC.Chat> loadedChats = new LongSparseArray<>();
+        try {
+            ArrayList<Long> usersToLoad = new ArrayList<>();
+            ArrayList<Long> chatsToLoad = new ArrayList<>();
+            for (long did : found) {
+                if (DialogObject.isUserDialog(did)) {
+                    usersToLoad.add(did);
+                } else {
+                    chatsToLoad.add(-did);
+                }
+            }
+            if (!usersToLoad.isEmpty()) {
+                ArrayList<TLRPC.User> result = new ArrayList<>();
+                storage.getUsersInternal(usersToLoad, result);
+                for (TLRPC.User user : result) {
+                    loadedUsers.put(user.id, user);
+                }
+            }
+            if (!chatsToLoad.isEmpty()) {
+                ArrayList<TLRPC.Chat> result = new ArrayList<>();
+                storage.getChatsInternal(TextUtils.join(",", chatsToLoad), result);
+                for (TLRPC.Chat chat : result) {
+                    loadedChats.put(chat.id, chat);
+                }
+            }
+        } catch (Exception e) {
+            FileLog.e(e);
+        }
+        AndroidUtilities.runOnUIThread(() -> {
+            if (account != currentAccount || revision != audioCatalogRevision) {
+                return;
+            }
+            scanningVideoDialogs = false;
+            ArrayList<TLRPC.User> userList = new ArrayList<>();
+            for (int i = 0; i < loadedUsers.size(); i++) {
+                users.put(loadedUsers.keyAt(i), loadedUsers.valueAt(i));
+                userList.add(loadedUsers.valueAt(i));
+            }
+            for (int i = 0; i < loadedChats.size(); i++) {
+                chats.put(loadedChats.keyAt(i), loadedChats.valueAt(i));
+            }
+            MessagesController.getInstance(account).putUsers(userList, true);
+            MessagesController.getInstance(account).putChats(toChatList(loadedChats), true);
+            ArrayList<Long> oldVideoDialogs = new ArrayList<>(videoDialogs);
+            boolean firstScan = !videoDialogsLoaded;
+            photoVideoDialogs.clear();
+            photoVideoDialogs.addAll(found);
+            rebuildVideoDialogs();
+            videoDialogsLoaded = true;
+            if (firstScan || !oldVideoDialogs.equals(videoDialogs)) {
+                notifyBrowseTree(MEDIA_ID_VIDEO_LIBRARY);
+            }
+            ArrayList<PendingBrowseRequest> requests = new ArrayList<>(pendingVideoBrowseRequests);
+            pendingVideoBrowseRequests.clear();
+            for (PendingBrowseRequest request : requests) {
+                request.callback.onResult(loadChildrenSync(request.parentMediaId));
+            }
+            if (videoRescanRequested) {
+                scanVideoDialogs();
+            }
+        });
+    }
+
+    /**
+     * Reads playable messages of one shared-media type for a chat. With firstOnly it stops at the
+     * first match, which is enough to decide whether a chat belongs in a list.
+     */
+    private static final String AUDIO_TYPES = MediaDataController.MEDIA_MUSIC + "," + MediaDataController.MEDIA_AUDIO;
+    private static final String PHOTOVIDEO_TYPES = String.valueOf(MediaDataController.MEDIA_PHOTOVIDEO);
+    private static final String VIDEO_TYPES = MediaDataController.MEDIA_PHOTOVIDEO + "," + MediaDataController.MEDIA_AUDIO;
+
+    private static ArrayList<MessageObject> readCarMessages(MessagesStorage storage, int account, long did, String types,
+                                                            boolean videoOnly, boolean firstOnly) {
+        ArrayList<MessageObject> result = new ArrayList<>();
+        SQLiteCursor cursor = null;
+        try {
+            cursor = storage.getDatabase().queryFinalized(String.format(Locale.US,
+                    "SELECT data, mid FROM media_v4 WHERE uid = %d AND mid > 0 AND type IN (%s) ORDER BY date DESC, mid DESC", did, types));
+            long clientUserId = UserConfig.getInstance(account).clientUserId;
+            while (cursor.next()) {
+                NativeByteBuffer data = cursor.byteBufferValue(0);
+                if (data == null) {
+                    continue;
+                }
+                TLRPC.Message message = TLRPC.Message.TLdeserialize(data, data.readInt32(false), false);
+                if (message == null) {
+                    data.reuse();
+                    continue;
+                }
+                message.readAttachPath(data, clientUserId);
+                data.reuse();
+                if (message.media instanceof TLRPC.TL_messageMediaPhoto) {
+                    continue;
+                }
+                message.id = cursor.intValue(1);
+                message.dialog_id = did;
+                MessageObject messageObject = new MessageObject(account, message, false, false);
+                if (isCarPlayable(messageObject) && (!videoOnly || isCarVideo(messageObject))) {
+                    result.add(messageObject);
+                    if (firstOnly) {
+                        break;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            FileLog.e(e);
+        } finally {
+            if (cursor != null) {
+                cursor.dispose();
+            }
+        }
+        return result;
+    }
+
+    /** Loads a chat's videos only when its Videos list is opened. */
+    private void loadVideosForDialog(long did, Runnable onLoaded) {
+        if (videoLoadedDialogs.contains(did)) {
+            if (onLoaded != null) {
+                onLoaded.run();
+            }
+            return;
+        }
+        ArrayList<Runnable> callbacks = pendingVideoLoads.get(did);
+        if (callbacks != null) {
+            if (onLoaded != null) {
+                callbacks.add(onLoaded);
+            }
+            return;
+        }
+        final ArrayList<Runnable> waiting = new ArrayList<>();
+        if (onLoaded != null) {
+            waiting.add(onLoaded);
+        }
+        pendingVideoLoads.put(did, waiting);
+        final int account = currentAccount;
+        final int revision = audioCatalogRevision;
+        final int generation = deletionGeneration;
+        MessagesStorage storage = MessagesStorage.getInstance(account);
+        storage.getStorageQueue().postRunnable(() -> {
+            ArrayList<MessageObject> videos = readCarMessages(storage, account, did, PHOTOVIDEO_TYPES, true, false);
+            AndroidUtilities.runOnUIThread(() -> {
+                ArrayList<MessageObject> messages = audioObjects.get(did);
+                if (account == currentAccount && revision == audioCatalogRevision && messages != null) {
+                    pendingVideoLoads.remove(did);
+                    videoLoadedDialogs.add(did);
+                    if (generation != deletionGeneration) {
+                        reloadDialog(did);
+                    } else if (mergeMessages(messages, videos)) {
+                        audioQueues.put(did, createAudioQueue(did, messages));
+                        invalidateSearchIndex();
+                        notifyDialogChanged(did, false);
+                    }
+                }
+                for (Runnable callback : waiting) {
+                    callback.run();
+                }
+            });
+        });
+    }
+
+    private static boolean mergeMessages(ArrayList<MessageObject> target, ArrayList<MessageObject> source) {
+        Set<Integer> known = new HashSet<>();
+        for (MessageObject message : target) {
+            known.add(message.getId());
+        }
+        boolean changed = false;
+        for (MessageObject message : source) {
+            if (known.add(message.getId())) {
+                target.add(message);
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    /** Re-reads a loaded chat from the database and swaps its list in place. */
+    private void reloadDialog(long did) {
+        if (audioObjects.get(did) == null || pendingAudioLoads.get(did) != null) {
+            scheduleCatalogRevalidate();
+            return;
+        }
+        final int account = currentAccount;
+        final int revision = audioCatalogRevision;
+        final boolean withVideos = videoLoadedDialogs.contains(did);
+        final int generation = deletionGeneration;
+        MessagesStorage storage = MessagesStorage.getInstance(account);
+        storage.getStorageQueue().postRunnable(() -> {
+            ArrayList<MessageObject> loaded = readDialogAudio(storage, account, did);
+            if (withVideos) {
+                loaded.addAll(readCarMessages(storage, account, did, PHOTOVIDEO_TYPES, true, false));
+            }
+            AndroidUtilities.runOnUIThread(() -> {
+                if (account != currentAccount || revision != audioCatalogRevision || audioObjects.get(did) == null) {
+                    return;
+                }
+                if (generation != deletionGeneration) {
+                    reloadDialog(did);
+                    return;
+                }
+                audioObjects.put(did, loaded);
+                audioQueues.put(did, createAudioQueue(did, loaded));
+                invalidateSearchIndex();
+                notifyDialogChanged(did, true);
+                scheduleCatalogRevalidate();
+            });
+        });
+    }
+
+    private static ArrayList<MessageObject> readDialogAudio(MessagesStorage storage, int account, long did) {
+        return readCarMessages(storage, account, did, AUDIO_TYPES, false, false);
     }
 
     private void loadAudioForDialog(long did, Runnable onLoaded) {
@@ -1215,60 +2236,38 @@ public class TelegramMediaSession {
         }
         pendingAudioLoads.put(did, callbacks);
 
+        readAudioForDialog(did, callbacks);
+    }
+
+    private void readAudioForDialog(long did, ArrayList<Runnable> waiting) {
         final int account = currentAccount;
         final int revision = audioCatalogRevision;
+        final int generation = deletionGeneration;
         MessagesStorage messagesStorage = MessagesStorage.getInstance(account);
         messagesStorage.getStorageQueue().postRunnable(() -> {
-            ArrayList<MessageObject> arrayList = new ArrayList<>();
-            ArrayList<MediaSessionCompat.QueueItem> queueList = new ArrayList<>();
-            try {
-                SQLiteCursor cursor = messagesStorage.getDatabase().queryFinalized(String.format(Locale.US, "SELECT data, mid FROM media_v4 WHERE uid = %d AND mid > 0 AND type IN (%d, %d, %d) ORDER BY date DESC, mid DESC", did, MediaDataController.MEDIA_AUDIO, MediaDataController.MEDIA_MUSIC, MediaDataController.MEDIA_PHOTOVIDEO));
-                while (cursor.next()) {
-                    NativeByteBuffer data = cursor.byteBufferValue(0);
-                    if (data == null) {
-                        continue;
-                    }
-                    TLRPC.Message message = TLRPC.Message.TLdeserialize(data, data.readInt32(false), false);
-                    if (message == null) {
-                        data.reuse();
-                        continue;
-                    }
-                    message.readAttachPath(data, UserConfig.getInstance(account).clientUserId);
-                    data.reuse();
-                    if (message.media instanceof TLRPC.TL_messageMediaPhoto) {
-                        continue;
-                    }
-                    message.id = cursor.intValue(1);
-                    message.dialog_id = did;
-                    MessageObject messageObject = new MessageObject(account, message, false, true);
-                    if (!isCarPlayable(messageObject)) {
-                        continue;
-                    }
-                    arrayList.add(messageObject);
-                }
-                cursor.dispose();
-                queueList.addAll(createAudioQueue(did, arrayList));
-            } catch (Exception e) {
-                FileLog.e(e);
-            }
-
+            ArrayList<MessageObject> arrayList = readDialogAudio(messagesStorage, account, did);
+            ArrayList<MediaSessionCompat.QueueItem> queueList = createAudioQueue(did, arrayList);
             AndroidUtilities.runOnUIThread(() -> {
-                if (account != currentAccount || revision != audioCatalogRevision) {
+                boolean current = account == currentAccount && revision == audioCatalogRevision;
+                if (current && generation != deletionGeneration) {
+                    readAudioForDialog(did, waiting);
                     return;
                 }
-                audioObjects.put(did, arrayList);
-                audioQueues.put(did, queueList);
-                ArrayList<Runnable> loadedCallbacks = pendingAudioLoads.get(did);
-                pendingAudioLoads.remove(did);
-                if (did == lastSelectedDialog) {
-                    applyQueueFor(did);
-                }
-                if (loadedCallbacks != null) {
-                    for (int i = 0; i < loadedCallbacks.size(); i++) {
-                        loadedCallbacks.get(i).run();
+                if (current) {
+                    audioObjects.put(did, arrayList);
+                    audioQueues.put(did, queueList);
+                    pendingAudioLoads.remove(did);
+                    if (did == lastSelectedDialog) {
+                        applyQueueFor(did);
                     }
                 }
-                loadCloudAudio(did);
+                // Always answer waiting browse requests so Android Auto never stays on a spinner.
+                for (int i = 0; i < waiting.size(); i++) {
+                    waiting.get(i).run();
+                }
+                if (current) {
+                    loadCloudAudio(did);
+                }
             });
         });
     }
@@ -1282,16 +2281,20 @@ public class TelegramMediaSession {
     }
 
     /** Discover channels with audio even when no shared-media history is cached on the phone. */
-    private void discoverChannelAudio(ArrayList<Long> channelDialogs, int index, int account, int revision) {
+    private void discoverChannelAudio(ArrayList<Long> channelDialogs, int index, int account, int revision, boolean force) {
         if (account != currentAccount || revision != audioCatalogRevision || index >= channelDialogs.size()) {
             return;
         }
         long did = channelDialogs.get(index);
+        if (!force && discoveredChannelCounts.get(did) != null) {
+            discoverChannelAudio(channelDialogs, index + 1, account, revision, force);
+            return;
+        }
         TLRPC.TL_messages_getSearchCounters request = new TLRPC.TL_messages_getSearchCounters();
         request.peer = MessagesController.getInstance(account).getInputPeer(did);
         if (request.peer == null || request.peer instanceof TLRPC.TL_inputPeerEmpty) {
             FileLog.e("Android Auto: missing channel peer " + did);
-            discoverChannelAudio(channelDialogs, index + 1, account, revision);
+            discoverChannelAudio(channelDialogs, index + 1, account, revision, force);
             return;
         }
         request.filters.add(new TLRPC.TL_inputMessagesFilterMusic());
@@ -1313,6 +2316,7 @@ public class TelegramMediaSession {
                                 count += ((TLRPC.TL_messages_searchCounter) object).count;
                             }
                         }
+                        discoveredChannelCounts.put(did, count);
                         audioCounts.put(did, count);
                         if (count > 0 && !dialogs.contains(did)) {
                             dialogs.add(did);
@@ -1323,7 +2327,8 @@ public class TelegramMediaSession {
                             notifyBrowseTree(MEDIA_ID_LIBRARY);
                         }
                     }
-                    discoverChannelAudio(channelDialogs, index + 1, account, revision);
+                    // Spaced out so a reconnect does not trigger FLOOD_WAIT for the whole account.
+                    AndroidUtilities.runOnUIThread(() -> discoverChannelAudio(channelDialogs, index + 1, account, revision, force), 300);
                 }));
         cloudRequestIds.add(requestId[0]);
     }
@@ -1350,16 +2355,24 @@ public class TelegramMediaSession {
             load = new CloudAudioLoad();
             cloudAudioLoads.put(did, load);
         }
-        if (load.loading || load.filterIndex >= 2) {
+        ArrayList<MessageObject> current = audioObjects.get(did);
+        if (load.loading || load.retryScheduled) {
+            return;
+        }
+        if (load.exhausted() || load.firstPageDone && current.size() >= load.target) {
+            flushCloudWaiters(load);
             return;
         }
         final CloudAudioLoad state = load;
         final int account = currentAccount;
         final int revision = audioCatalogRevision;
+        requestCloudCounts(did, state);
         TLRPC.TL_messages_search request = new TLRPC.TL_messages_search();
         request.peer = MessagesController.getInstance(account).getInputPeer(did);
         if (request.peer == null || request.peer instanceof TLRPC.TL_inputPeerEmpty) {
             FileLog.e("Android Auto: missing audio peer " + did);
+            state.filterIndex = 2;
+            flushCloudWaiters(state);
             return;
         }
         request.q = "";
@@ -1376,9 +2389,21 @@ public class TelegramMediaSession {
                     }
                     cloudRequestIds.remove(requestId[0]);
                     state.loading = false;
+                    if (error != null && error.text != null && error.text.startsWith("FLOOD_WAIT_")) {
+                        int seconds = Utilities.parseInt(error.text);
+                        state.retryScheduled = true;
+                        AndroidUtilities.runOnUIThread(() -> {
+                            if (account == currentAccount && revision == audioCatalogRevision) {
+                                state.retryScheduled = false;
+                                loadCloudAudio(did);
+                            }
+                        }, Math.max(1, seconds) * 1000L + 500);
+                        return;
+                    }
                     if (error != null || !(response instanceof TLRPC.messages_Messages)) {
                         FileLog.e("Android Auto: audio page failed for " + did + ": "
                                 + (error != null ? error.text : "invalid response"));
+                        flushCloudWaiters(state);
                         if (pendingPlayDialog == did) {
                             cancelPendingPlay();
                             reportPlaybackError("Android Auto: could not load audio");
@@ -1386,11 +2411,20 @@ public class TelegramMediaSession {
                         return;
                     }
                     TLRPC.messages_Messages result = (TLRPC.messages_Messages) response;
+                    if (state.offsetId == 0) {
+                        state.serverCounts[state.filterIndex] = Math.max(result.count, result.messages.size());
+                    }
                     MessagesController controller = MessagesController.getInstance(account);
                     controller.putUsers(result.users, false);
                     controller.putChats(result.chats, false);
                     MessagesStorage.getInstance(account).putUsersAndChats(result.users, result.chats, true, true);
                     ArrayList<MessageObject> messages = audioObjects.get(did);
+                    if (messages == null) {
+                        flushCloudWaiters(state);
+                        return;
+                    }
+                    state.firstPageDone = true;
+                    boolean wasEmpty = messages.isEmpty();
                     Set<Integer> knownIds = new HashSet<>();
                     for (MessageObject message : messages) {
                         knownIds.add(message.getId());
@@ -1411,21 +2445,17 @@ public class TelegramMediaSession {
                     boolean changed = false;
                     for (TLRPC.Message message : result.messages) {
                         message.dialog_id = did;
-                        MessageObject object = new MessageObject(account, message, false, true);
+                        MessageObject object = new MessageObject(account, message, false, false);
                         if (isCarPlayable(object) && knownIds.add(message.id)) {
                             messages.add(object);
                             changed = true;
                         }
                     }
                     if (changed) {
+                        sortByDateDesc(messages);
                         audioQueues.put(did, createAudioQueue(did, messages));
-                        if (lastSelectedDialog == did) {
-                            session.setQueue(audioQueues.get(did));
-                        }
-                        searchIndex = null;
-                        searchIndexRevision = -1;
-                        notifyBrowseTree(MEDIA_ID_CHAT_PREFIX + did);
-                        notifyBrowseTree(MEDIA_ID_VIDEO_CHAT_PREFIX + did);
+                        invalidateSearchIndex();
+                        notifyDialogChanged(did, wasEmpty);
                     }
                     // A short page need not be the last one; continue until the server is exhausted.
                     if (serverPageEmpty || nextOffset == Integer.MAX_VALUE
@@ -1449,23 +2479,95 @@ public class TelegramMediaSession {
         cloudRequestIds.add(requestId[0]);
     }
 
-    private static ArrayList<MediaSessionCompat.QueueItem> createAudioQueue(long did, ArrayList<MessageObject> messages) {
-        // Alphabetical order lets Android Auto group items by letter and show its A-Z jump.
-        final java.text.Collator collator = java.text.Collator.getInstance();
-        collator.setStrength(java.text.Collator.PRIMARY);
+    /** One cheap request that tells how many pages a chat has before they are downloaded. */
+    private void requestCloudCounts(long did, CloudAudioLoad state) {
+        if (state.countsRequested) {
+            return;
+        }
+        TLRPC.InputPeer peer = MessagesController.getInstance(currentAccount).getInputPeer(did);
+        if (peer == null || peer instanceof TLRPC.TL_inputPeerEmpty) {
+            return;
+        }
+        state.countsRequested = true;
+        final int account = currentAccount;
+        final int revision = audioCatalogRevision;
+        TLRPC.TL_messages_getSearchCounters request = new TLRPC.TL_messages_getSearchCounters();
+        request.peer = peer;
+        request.filters.add(new TLRPC.TL_inputMessagesFilterMusic());
+        request.filters.add(new TLRPC.TL_inputMessagesFilterRoundVoice());
+        final int[] requestId = new int[1];
+        requestId[0] = ConnectionsManager.getInstance(account).sendRequest(request, (response, error) ->
+                AndroidUtilities.runOnUIThread(() -> {
+                    if (account != currentAccount || revision != audioCatalogRevision) {
+                        return;
+                    }
+                    cloudRequestIds.remove(requestId[0]);
+                    if (!(response instanceof Vector)) {
+                        state.countsRequested = false;
+                        return;
+                    }
+                    for (Object object : ((Vector) response).objects) {
+                        if (!(object instanceof TLRPC.TL_messages_searchCounter)) {
+                            continue;
+                        }
+                        TLRPC.TL_messages_searchCounter counter = (TLRPC.TL_messages_searchCounter) object;
+                        int index = counter.filter instanceof TLRPC.TL_inputMessagesFilterMusic ? 0
+                                : counter.filter instanceof TLRPC.TL_inputMessagesFilterRoundVoice ? 1 : -1;
+                        if (index >= 0 && state.serverCounts[index] < 0) {
+                            state.serverCounts[index] = counter.count;
+                        }
+                    }
+                    notifyDialogChanged(did, false);
+                }));
+        cloudRequestIds.add(requestId[0]);
+    }
+
+    /** Number of audio items a chat has, including ones not downloaded from the server yet. */
+    private int getAudioTotal(long did, int loaded) {
+        CloudAudioLoad load = cloudAudioLoads.get(did);
+        if (load == null || load.exhausted()) {
+            return loaded;
+        }
+        int server = Math.max(load.serverCounts[0], 0) + Math.max(load.serverCounts[1], 0);
+        if (load.serverCounts[0] < 0 && load.serverCounts[1] < 0) {
+            // Totals unknown: offer one more page while the server may still have items.
+            return loaded >= BROWSE_PAGE_SIZE ? loaded + 1 : loaded;
+        }
+        return Math.max(loaded, server);
+    }
+
+    private static void flushCloudWaiters(CloudAudioLoad state) {
+        ArrayList<Runnable> waiters = new ArrayList<>(state.waiters);
+        state.waiters.clear();
+        for (Runnable waiter : waiters) {
+            waiter.run();
+        }
+    }
+
+    private static void sortByDateDesc(ArrayList<MessageObject> messages) {
         Collections.sort(messages, (a, b) -> {
-            String ta = getAudioTitle(a);
-            String tb = getAudioTitle(b);
-            return collator.compare(ta != null ? ta.trim() : "", tb != null ? tb.trim() : "");
+            int byDate = Integer.compare(b.messageOwner.date, a.messageOwner.date);
+            return byDate != 0 ? byDate : Integer.compare(b.getId(), a.getId());
         });
+    }
+
+    /** Chat lists stay newest first so numbered pages keep their items while more pages load. */
+    private static ArrayList<MediaSessionCompat.QueueItem> createAudioQueue(long did, ArrayList<MessageObject> messages) {
+        sortByDateDesc(messages);
+        return createAudioQueue(messages, MEDIA_ID_MESSAGE_PREFIX);
+    }
+
+    private static ArrayList<MediaSessionCompat.QueueItem> createAudioQueue(ArrayList<MessageObject> messages, String prefix) {
         ArrayList<MediaSessionCompat.QueueItem> queue = new ArrayList<>();
         for (MessageObject message : messages) {
             MediaDescriptionCompat description = new MediaDescriptionCompat.Builder()
-                    .setMediaId(MEDIA_ID_MESSAGE_PREFIX + did + "_" + message.getId())
+                    .setMediaId(prefix + message.getDialogId() + "_" + message.getId())
                     .setTitle(getAudioTitle(message))
                     .setSubtitle(withDuration(message.getMusicAuthor(), (int) message.getDuration()))
                     .build();
-            queue.add(new MediaSessionCompat.QueueItem(description, message.getId()));
+            // Favorites mix chats, so their queue ids are positions rather than message ids.
+            long queueId = MEDIA_ID_MESSAGE_PREFIX.equals(prefix) ? message.getId() : queue.size();
+            queue.add(new MediaSessionCompat.QueueItem(description, queueId));
         }
         return queue;
     }
@@ -1473,7 +2575,7 @@ public class TelegramMediaSession {
     private void playAudio(long dialogId, int index) {
         ArrayList<MessageObject> messages = audioObjects.get(dialogId);
         if (messages == null) {
-            loadAudioForDialog(dialogId, () -> playAudio(dialogId, index));
+            loadAudioForDialog(dialogId, guarded(() -> playAudio(dialogId, index)));
             return;
         }
         if (index < 0 || index >= messages.size()) {
@@ -1491,8 +2593,24 @@ public class TelegramMediaSession {
             return;
         }
 
+        if (index >= messages.size() - PREFETCH_DISTANCE) {
+            ensureCloudItems(dialogId, messages.size() + CLOUD_AUDIO_PAGE_SIZE, () -> {}, null);
+        }
+        lastSelectedDialog = dialogId;
+        MessagesController.getNotificationsSettings(currentAccount).edit()
+                .putLong("auto_lastSelectedDialog", dialogId).apply();
+        playingSnapshot = null;
+        startPlayback(messages, index, audioQueues.get(dialogId), getDialogTitle(dialogId));
+    }
+
+    /** Plays one item of a list, resuming from where it was last left. */
+    private void startPlayback(ArrayList<MessageObject> messages, int index,
+                               @Nullable ArrayList<MediaSessionCompat.QueueItem> queue, String queueTitle) {
         cancelPendingPlay();
+        savePlayingPosition(true);
         MessageObject selected = messages.get(index);
+        float resume = CarPlaybackStore.getPosition(currentAccount, selected.getDialogId(), selected.getId());
+        selected.forceSeekTo = resume > 0 ? resume : -1;
         if (!isCarVideo(selected) && !FileLoader.getInstance(currentAccount).getPathToMessage(selected.messageOwner).exists()
                 && (TextUtils.isEmpty(selected.messageOwner.attachPath)
                 || !new File(selected.messageOwner.attachPath).exists())) {
@@ -1500,10 +2618,6 @@ public class TelegramMediaSession {
                     FileLoader.PRIORITY_HIGH, selected.shouldEncryptPhotoOrVideo() ? 2 : 0);
         }
         MediaController controller = MediaController.getInstance();
-        lastSelectedDialog = dialogId;
-        MessagesController.getNotificationsSettings(currentAccount).edit()
-                .putLong("auto_lastSelectedDialog", dialogId).apply();
-
         ArrayList<MessageObject> playlist = new ArrayList<>();
         for (MessageObject message : messages) {
             if (getCarKind(selected) == getCarKind(message)) {
@@ -1523,11 +2637,10 @@ public class TelegramMediaSession {
             return;
         }
 
-        ArrayList<MediaSessionCompat.QueueItem> queue = audioQueues.get(dialogId);
         if (queue != null) {
             session.setQueue(queue);
         }
-        session.setQueueTitle(getDialogTitle(dialogId));
+        session.setQueueTitle(queueTitle);
     }
 
     private void skipToAdjacentAudio(int direction) {
@@ -1542,6 +2655,12 @@ public class TelegramMediaSession {
                 next.resetPlayingProgress();
                 controller.playMessage(next);
             }
+            return;
+        }
+        int snapshotIndex = indexInSnapshot(playing);
+        if (snapshotIndex >= 0 && !(SharedConfig.shuffleMusic && playing.isMusic())) {
+            int size = playingSnapshot.size();
+            playSnapshotItem((snapshotIndex + direction + size) % size);
             return;
         }
         ArrayList<MessageObject> messages = audioObjects.get(playing.getDialogId());
@@ -1567,47 +2686,158 @@ public class TelegramMediaSession {
         } else {
             return 0;
         }
+        String id = parentMediaId.substring(prefix.length());
+        int separator = id.indexOf(PAGE_SEPARATOR);
+        if (separator >= 0) {
+            id = id.substring(0, separator);
+        }
         try {
-            return Long.parseLong(parentMediaId.substring(prefix.length()));
+            return Long.parseLong(id);
         } catch (Exception e) {
             FileLog.e(e);
             return 0;
         }
     }
 
+    /** Item offset of a paged list; page ids look like "<list id>@<offset>". */
+    private static int getPageOffset(String parentMediaId) {
+        int separator = parentMediaId != null ? parentMediaId.indexOf(PAGE_SEPARATOR) : -1;
+        if (separator < 0) {
+            return 0;
+        }
+        Integer offset = Utilities.parseInt(parentMediaId.substring(separator + 1));
+        return offset != null && offset > 0 ? offset : 0;
+    }
+
     private List<MediaBrowser.MediaItem> loadChildrenSync(String parentMediaId) {
         List<MediaBrowser.MediaItem> mediaItems = new ArrayList<>();
         if (MEDIA_ID_ROOT.equals(parentMediaId)) {
-            mediaItems.add(new MediaBrowser.MediaItem(new android.media.MediaDescription.Builder()
-                    .setMediaId(MEDIA_ID_LIBRARY)
-                    .setTitle(LocaleController.getString(R.string.CarTabAudio))
-                    .build(), MediaBrowser.MediaItem.FLAG_BROWSABLE));
-            mediaItems.add(new MediaBrowser.MediaItem(new android.media.MediaDescription.Builder()
-                    .setMediaId(MEDIA_ID_VIDEO_LIBRARY)
-                    .setTitle(LocaleController.getString(R.string.CarTabVideos))
-                    .build(), MediaBrowser.MediaItem.FLAG_BROWSABLE));
-        } else if (MEDIA_ID_LIBRARY.equals(parentMediaId)) {
-            for (int a = 0; a < dialogs.size(); a++) {
-                mediaItems.add(buildChatItem(MEDIA_ID_CHAT_PREFIX, dialogs.get(a), null));
+            mediaItems.add(buildTab(MEDIA_ID_LIBRARY, R.string.CarTabAudio));
+            mediaItems.add(buildTab(MEDIA_ID_VIDEO_LIBRARY, R.string.CarTabVideos));
+            mediaItems.add(buildTab(MEDIA_ID_FAVORITES, R.string.CarTabFavorites));
+            mediaItems.add(buildTab(MEDIA_ID_RECENT, R.string.CarTabRecent));
+        } else if (MEDIA_ID_RESUME.equals(parentMediaId)) {
+            ArrayList<CarPlaybackStore.Favorite> list = getStoredList(MEDIA_ID_RECENT_PREFIX);
+            if (!list.isEmpty() && list.get(0).message != null) {
+                CarPlaybackStore.Favorite item = list.get(0);
+                mediaItems.add(buildPlayableItem(MEDIA_ID_RECENT_PREFIX + item.dialogId + "_" + item.messageId, item.message, null));
             }
-        } else if (MEDIA_ID_VIDEO_LIBRARY.equals(parentMediaId)) {
-            for (int a = 0; a < videoDialogs.size(); a++) {
-                mediaItems.add(buildChatItem(MEDIA_ID_VIDEO_CHAT_PREFIX, videoDialogs.get(a), null));
+        } else if (parentMediaId.startsWith(MEDIA_ID_FAVORITES) || parentMediaId.startsWith(MEDIA_ID_RECENT)) {
+            String prefix = parentMediaId.startsWith(MEDIA_ID_RECENT) ? MEDIA_ID_RECENT_PREFIX : MEDIA_ID_FAVORITE_PREFIX;
+            ArrayList<CarPlaybackStore.Favorite> list = getStoredList(prefix);
+            if (MEDIA_ID_RECENT_PREFIX.equals(prefix) && !list.isEmpty() && getPageOffset(parentMediaId) == 0) {
+                mediaItems.add(new MediaBrowser.MediaItem(new android.media.MediaDescription.Builder()
+                        .setMediaId(MEDIA_ID_CLEAR_RECENT)
+                        .setTitle(LocaleController.getString(R.string.CarClearRecent))
+                        .build(), MediaBrowser.MediaItem.FLAG_PLAYABLE));
             }
+            appendPage(mediaItems, parentMediaId, list.size(), list.size(), index -> {
+                CarPlaybackStore.Favorite item = list.get(index);
+                return buildPlayableItem(prefix + item.dialogId + "_" + item.messageId, item.message, null);
+            }, null, true);
+        } else if (parentMediaId.startsWith(MEDIA_ID_LIBRARY) || parentMediaId.startsWith(MEDIA_ID_VIDEO_LIBRARY)) {
+            boolean videos = parentMediaId.startsWith(MEDIA_ID_VIDEO_LIBRARY);
+            ArrayList<Long> list = videos ? videoDialogs : dialogs;
+            String prefix = videos ? MEDIA_ID_VIDEO_CHAT_PREFIX : MEDIA_ID_CHAT_PREFIX;
+            appendPage(mediaItems, parentMediaId, list.size(), list.size(),
+                    index -> buildChatItem(prefix, list.get(index), null), null, true);
         } else if (getDialogIdFromMediaId(parentMediaId) != 0) {
             long did = getDialogIdFromMediaId(parentMediaId);
             boolean videos = parentMediaId.startsWith(MEDIA_ID_VIDEO_CHAT_PREFIX);
             ArrayList<MessageObject> arrayList = audioObjects.get(did);
             if (arrayList != null) {
-                for (int a = 0; a < arrayList.size(); a++) {
-                    MessageObject messageObject = arrayList.get(a);
+                ArrayList<MessageObject> items = new ArrayList<>();
+                for (MessageObject messageObject : arrayList) {
                     if (isCarVideo(messageObject) == videos) {
-                        mediaItems.add(buildPlayableItem(MEDIA_ID_MESSAGE_PREFIX + did + "_" + messageObject.getId(), messageObject, null));
+                        items.add(messageObject);
                     }
                 }
+                int total = videos ? items.size() : getAudioTotal(did, items.size());
+                appendPage(mediaItems, parentMediaId, total, items.size(), index -> {
+                    MessageObject messageObject = items.get(index);
+                    return buildPlayableItem(MEDIA_ID_MESSAGE_PREFIX + did + "_" + messageObject.getId(), messageObject, null);
+                }, getFallbackCoverUri(videos), false);
             }
         }
         return mediaItems;
+    }
+
+    private static MediaBrowser.MediaItem buildTab(String mediaId, int titleRes) {
+        return new MediaBrowser.MediaItem(new android.media.MediaDescription.Builder()
+                .setMediaId(mediaId)
+                .setTitle(LocaleController.getString(titleRes))
+                .build(), MediaBrowser.MediaItem.FLAG_BROWSABLE);
+    }
+
+    private interface ItemAt {
+        MediaBrowser.MediaItem get(int index);
+    }
+
+    /**
+     * Adds one page of a list. Android Auto cannot be scrolled by an app, so long lists are split
+     * into short pages.
+     *
+     * @param pageIndex true lists every page at the end so any page is one level below the list;
+     *                  false adds a single "next page" row at the top and the bottom instead.
+     */
+    private void appendPage(List<MediaBrowser.MediaItem> out, String parentMediaId, int total, int available,
+                            ItemAt itemAt, @Nullable Uri pageIcon, boolean pageIndex) {
+        int separator = parentMediaId.indexOf(PAGE_SEPARATOR);
+        String base = separator >= 0 ? parentMediaId.substring(0, separator) : parentMediaId;
+        int offset = Math.min(getPageOffset(parentMediaId), Math.max(0, available - 1)) / BROWSE_PAGE_SIZE * BROWSE_PAGE_SIZE;
+        int end = Math.min(offset + BROWSE_PAGE_SIZE, available);
+        int count = Math.max(total, available);
+        if (!pageIndex) {
+            MediaBrowser.MediaItem nextPage = null;
+            if (count > offset + BROWSE_PAGE_SIZE) {
+                int next = offset + BROWSE_PAGE_SIZE;
+                nextPage = buildPageRow(base + PAGE_SEPARATOR + next,
+                        LocaleController.formatString(R.string.CarNextPage, next / BROWSE_PAGE_SIZE + 1),
+                        next, count, pageIcon);
+            }
+            if (nextPage != null && end - offset > 1) {
+                out.add(nextPage);
+            }
+            for (int i = offset; i < end; i++) {
+                out.add(itemAt.get(i));
+            }
+            if (nextPage != null) {
+                out.add(nextPage);
+            }
+            return;
+        }
+        for (int i = offset; i < end; i++) {
+            out.add(itemAt.get(i));
+        }
+        int pages = (count + BROWSE_PAGE_SIZE - 1) / BROWSE_PAGE_SIZE;
+        if (pages <= 1) {
+            return;
+        }
+        int current = offset / BROWSE_PAGE_SIZE;
+        for (int page = 0; page < pages; page++) {
+            if (page == current) {
+                continue;
+            }
+            int pageOffset = page * BROWSE_PAGE_SIZE;
+            out.add(buildPageRow(page == 0 ? base : base + PAGE_SEPARATOR + pageOffset,
+                    LocaleController.formatString(R.string.CarPageNumber, page + 1), pageOffset, count, pageIcon));
+        }
+    }
+
+    @Nullable
+    private static MediaBrowser.MediaItem buildPageRow(String mediaId, String title, int offset, int count, @Nullable Uri icon) {
+        if (mediaId == null) {
+            return null;
+        }
+        android.media.MediaDescription.Builder builder = new android.media.MediaDescription.Builder()
+                .setMediaId(mediaId)
+                .setTitle(title)
+                .setSubtitle(LocaleController.formatString(R.string.CarPageRange, offset + 1,
+                        Math.min(offset + BROWSE_PAGE_SIZE, count)));
+        if (icon != null) {
+            builder.setIconUri(icon);
+        }
+        return new MediaBrowser.MediaItem(builder.build(), MediaBrowser.MediaItem.FLAG_BROWSABLE);
     }
 
     private final android.util.SparseArray<Bitmap> specialAvatars = new android.util.SparseArray<>();
@@ -1637,71 +2867,32 @@ public class TelegramMediaSession {
         return buildChatItem(prefix, dialogId, subtitle, null);
     }
 
-    private final Set<String> requestedAvatars = new HashSet<>();
-
-    /** Downloads a changed or missing chat photo; fileLoaded then refreshes the chat list. */
-    private void requestAvatar(long dialogId, TLRPC.FileLocation avatar) {
-        String name = FileLoader.getAttachFileName(avatar);
-        if (TextUtils.isEmpty(name) || !requestedAvatars.add(name)) {
-            return;
-        }
-        ImageLocation location;
-        Object parent;
-        if (DialogObject.isUserDialog(dialogId)) {
-            TLRPC.User user = MessagesController.getInstance(currentAccount).getUser(dialogId);
-            location = user != null ? ImageLocation.getForUser(user, ImageLocation.TYPE_SMALL) : null;
-            parent = user;
-        } else {
-            TLRPC.Chat chat = MessagesController.getInstance(currentAccount).getChat(-dialogId);
-            location = chat != null ? ImageLocation.getForChat(chat, ImageLocation.TYPE_SMALL) : null;
-            parent = chat;
-        }
-        if (location == null) {
-            requestedAvatars.remove(name);
-            return;
-        }
-        FileLoader.getInstance(currentAccount).loadFile(location, parent, "jpg", FileLoader.PRIORITY_NORMAL, 1);
-    }
-
     private MediaBrowser.MediaItem buildChatItem(String prefix, long dialogId, @Nullable String subtitle, @Nullable Bundle extras) {
         android.media.MediaDescription.Builder builder = new android.media.MediaDescription.Builder()
                 .setMediaId(prefix + dialogId);
         String title = getDialogTitle(dialogId);
         builder.setTitle(pinnedDialogs.contains(dialogId) ? "\uD83D\uDCCC " + title : title);
-        TLRPC.FileLocation avatar = null;
         boolean savedMessages = dialogId == UserConfig.getInstance(currentAccount).getClientUserId();
         Bitmap specialAvatar = savedMessages ? getSpecialAvatar(org.telegram.ui.Components.AvatarDrawable.AVATAR_TYPE_SAVED)
                 : UserObject.isReplyUser(dialogId) ? getSpecialAvatar(org.telegram.ui.Components.AvatarDrawable.AVATAR_TYPE_REPLIES) : null;
         if (specialAvatar != null) {
             builder.setIconBitmap(specialAvatar);
-        } else if (DialogObject.isUserDialog(dialogId)) {
-            TLRPC.User user = MessagesController.getInstance(currentAccount).getUser(dialogId);
-            if (user == null) {
-                user = users.get(dialogId);
-            }
-            if (user != null && user.photo != null && !(user.photo.photo_small instanceof TLRPC.TL_fileLocationUnavailable)) {
-                avatar = user.photo.photo_small;
-            }
         } else {
-            TLRPC.Chat chat = MessagesController.getInstance(currentAccount).getChat(-dialogId);
-            if (chat == null) {
-                chat = chats.get(-dialogId);
-            }
-            if (chat != null && chat.photo != null && !(chat.photo.photo_small instanceof TLRPC.TL_fileLocationUnavailable)) {
-                avatar = chat.photo.photo_small;
-            }
-        }
-        Bitmap bitmap = null;
-        if (avatar != null) {
-            bitmap = createRoundBitmap(FileLoader.getInstance(currentAccount).getPathToAttach(avatar, true));
-            if (bitmap != null) {
-                builder.setIconBitmap(bitmap);
+            TLRPC.User user = null;
+            TLRPC.Chat chat = null;
+            if (DialogObject.isUserDialog(dialogId)) {
+                user = MessagesController.getInstance(currentAccount).getUser(dialogId);
+                if (user == null) {
+                    user = users.get(dialogId);
+                }
             } else {
-                requestAvatar(dialogId, avatar);
+                chat = MessagesController.getInstance(currentAccount).getChat(-dialogId);
+                if (chat == null) {
+                    chat = chats.get(-dialogId);
+                }
             }
-        }
-        if (specialAvatar == null && (avatar == null || bitmap == null)) {
-            builder.setIconUri(Uri.parse("android.resource://" + appContext.getPackageName() + "/drawable/contact_blue"));
+            Uri avatarUri = CarArtworkProvider.getAvatarUri(currentAccount, dialogId, user, chat);
+            builder.setIconUri(avatarUri != null ? avatarUri : getFallbackCoverUri(false));
         }
         if (subtitle != null) {
             builder.setSubtitle(subtitle);
@@ -1716,26 +2907,39 @@ public class TelegramMediaSession {
         if (durationSeconds <= 0) {
             return subtitle;
         }
-        String duration = String.format(Locale.US, "(%02d:%02d)", durationSeconds / 60, durationSeconds % 60);
+        int hours = durationSeconds / 3600;
+        int minutes = durationSeconds / 60 % 60;
+        int seconds = durationSeconds % 60;
+        String duration = hours > 0
+                ? String.format(Locale.US, "(%02d:%02d:%02d)", hours, minutes, seconds)
+                : String.format(Locale.US, "(%02d:%02d)", minutes, seconds);
         return TextUtils.isEmpty(subtitle) ? duration : duration + " \u00B7 " + subtitle;
     }
 
     private MediaBrowser.MediaItem buildPlayableItem(String mediaId, MessageObject messageObject, @Nullable Bundle extras) {
+        String title = getAudioTitle(messageObject);
+        if (isFavorite(messageObject.getDialogId(), messageObject.getId())) {
+            title = "\u2B50 " + title;
+        }
         android.media.MediaDescription.Builder builder = new android.media.MediaDescription.Builder()
                 .setMediaId(mediaId)
-                .setTitle(getAudioTitle(messageObject));
+                .setTitle(title);
+        float position = CarPlaybackStore.getPosition(currentAccount, messageObject.getDialogId(), messageObject.getId());
+        if (position > 0) {
+            // Shows a partially-played indicator on hosts that support it.
+            extras = extras != null ? new Bundle(extras) : new Bundle();
+            extras.putInt(EXTRA_PLAYBACK_STATUS, PLAYBACK_STATUS_PARTIALLY_PLAYED);
+            extras.putDouble(EXTRA_COMPLETION_PERCENTAGE, position);
+        }
         String author = messageObject.getMusicAuthor();
         String videoLabel = getVideoLabel(messageObject);
         if (videoLabel != null) {
             author = TextUtils.isEmpty(author) ? videoLabel : videoLabel + " \u00B7 " + author;
         }
         builder.setSubtitle(withDuration(author, (int) messageObject.getDuration()));
-        Bitmap cover = getAudioCover(messageObject);
-        if (cover != null) {
-            builder.setIconBitmap(cover);
-        } else {
-            builder.setIconUri(getFallbackCoverUri(isCarVideo(messageObject)));
-        }
+        boolean video = isCarVideo(messageObject);
+        Uri cover = CarArtworkProvider.getCoverUri(messageObject, video);
+        builder.setIconUri(cover != null ? cover : getFallbackCoverUri(video));
         if (extras != null) {
             builder.setExtras(extras);
         }
@@ -1743,6 +2947,9 @@ public class TelegramMediaSession {
     }
 
     /** Media browser search: returns playable items across all chats. */
+    private static final String EXTRA_PLAYBACK_STATUS = "android.media.extra.PLAYBACK_STATUS";
+    private static final String EXTRA_COMPLETION_PERCENTAGE = "androidx.media.MediaItem.Extras.COMPLETION_PERCENTAGE";
+    private static final int PLAYBACK_STATUS_PARTIALLY_PLAYED = 1;
     private static final String CONTENT_STYLE_GROUP_TITLE_HINT = "android.media.browse.CONTENT_STYLE_GROUP_TITLE_HINT";
     private static Bundle groupExtras(String title) {
         Bundle extras = new Bundle();
@@ -1961,7 +3168,7 @@ public class TelegramMediaSession {
         return bitmap;
     }
 
-    private static Bitmap addVideoBadge(Bitmap source) {
+    static Bitmap addVideoBadge(Bitmap source) {
         Bitmap result = source.isMutable() ? source : source.copy(Bitmap.Config.ARGB_8888, true);
         if (result == null) {
             return source;
@@ -2039,7 +3246,7 @@ public class TelegramMediaSession {
         return decodeCover(file, bytes, COVER_SIZE_PX);
     }
 
-    private static Bitmap decodeCover(@Nullable File file, @Nullable byte[] bytes, int sizePx) {
+    static Bitmap decodeCover(@Nullable File file, @Nullable byte[] bytes, int sizePx) {
         BitmapFactory.Options bounds = new BitmapFactory.Options();
         bounds.inJustDecodeBounds = true;
         if (file != null) {
@@ -2170,8 +3377,14 @@ public class TelegramMediaSession {
 
         @Override
         public void onPlay() {
+            if (consumeAutoplay()) {
+                return;
+            }
             MessageObject messageObject = MediaController.getInstance().getPlayingMessageObject();
             if (messageObject == null) {
+                if (resumeLastPlayed()) {
+                    return;
+                }
                 ensureLoaded(() -> {
                     if (lastSelectedDialog != 0) {
                         playAudio(lastSelectedDialog, 0);
@@ -2192,16 +3405,23 @@ public class TelegramMediaSession {
 
         @Override
         public void onSkipToNext() {
+            blockAutoplay = false;
             skipToAdjacentAudio(1);
         }
 
         @Override
         public void onSkipToPrevious() {
+            blockAutoplay = false;
             skipToAdjacentAudio(-1);
         }
 
         @Override
         public void onSkipToQueueItem(long queueId) {
+            blockAutoplay = false;
+            if (playingSnapshot != null) {
+                playSnapshotItem((int) queueId);
+                return;
+            }
             playAudioMessage(lastSelectedDialog, (int) queueId);
         }
 
@@ -2251,11 +3471,16 @@ public class TelegramMediaSession {
 
         @Override
         public void onPrepare() {
-            // No-op: nothing to prepare without a target. Hosts call prepareFromX with args.
+            if (MediaController.getInstance().getPlayingMessageObject() == null) {
+                showLastPlayed();
+            }
         }
 
         @Override
         public void onPrepareFromMediaId(String mediaId, Bundle extras) {
+            if (MEDIA_ID_CLEAR_RECENT.equals(mediaId)) {
+                return;
+            }
             onPlayFromMediaId(mediaId, extras);
         }
 
@@ -2266,7 +3491,25 @@ public class TelegramMediaSession {
 
         @Override
         public void onPlayFromMediaId(String mediaId, Bundle extras) {
+            blockAutoplay = false;
             if (TextUtils.isEmpty(mediaId)) return;
+            if (MEDIA_ID_CLEAR_RECENT.equals(mediaId)) {
+                clearRecent();
+                return;
+            }
+            String listPrefix = mediaId.startsWith(MEDIA_ID_FAVORITE_PREFIX) ? MEDIA_ID_FAVORITE_PREFIX
+                    : mediaId.startsWith(MEDIA_ID_RECENT_PREFIX) ? MEDIA_ID_RECENT_PREFIX : null;
+            if (listPrefix != null) {
+                String[] parts = mediaId.substring(listPrefix.length()).split("_");
+                if (parts.length == 2) {
+                    try {
+                        playFromStoredList(listPrefix, Long.parseLong(parts[0]), Integer.parseInt(parts[1]));
+                    } catch (Exception e) {
+                        FileLog.e(e);
+                    }
+                }
+                return;
+            }
             if (mediaId.startsWith(MEDIA_ID_MESSAGE_PREFIX)) {
                 String[] parts = mediaId.substring(MEDIA_ID_MESSAGE_PREFIX.length()).split("_");
                 if (parts.length == 2) {
@@ -2310,6 +3553,13 @@ public class TelegramMediaSession {
 
         @Override
         public void onCustomAction(String action, Bundle extras) {
+            if (CUSTOM_ACTION_FAVORITE.equals(action)) {
+                MessageObject playing = MediaController.getInstance().getPlayingMessageObject();
+                if (playing != null && isCarPlayable(playing)) {
+                    toggleFavorite(playing);
+                }
+                return;
+            }
             if (MusicPlayerService.NOTIFY_REPEAT.equals(action)) {
                 SharedConfig.setRepeatMode((SharedConfig.repeatMode + 1) % 3);
                 updateRepeatMode();
