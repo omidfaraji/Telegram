@@ -1107,8 +1107,15 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
 
     public boolean isAudioOnlyVideo(MessageObject messageObject) {
         return messageObject != null
-                && (messageObject.isVideo() || messageObject.isRoundVideo())
+                && (messageObject.isVideo() || messageObject.isRoundVideo() || TelegramMediaSession.isCarAudioDocument(messageObject))
                 && audioOnlyVideoKeys.contains(audioOnlyKey(messageObject));
+    }
+
+    // Set around an explicit next/previous so the next item ignores any saved position.
+    private boolean startNextFromBeginning;
+
+    public void setStartNextFromBeginning(boolean value) {
+        startNextFromBeginning = value;
     }
 
     private boolean isVoiceLikeForPlaylist(MessageObject messageObject) {
@@ -3718,6 +3725,11 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
         if (messageObject == null) {
             return false;
         }
+        if (startNextFromBeginning && !isSamePlayingMessage(messageObject)) {
+            startNextFromBeginning = false;
+            messageObject.resetPlayingProgress();
+            messageObject.forceSeekTo = 0;
+        }
         isSilent = silent;
         checkVolumeBarUI();
         if (!audioOnlyVideoKeys.isEmpty() && !audioOnlyVideoKeys.contains(audioOnlyKey(messageObject))) {
@@ -3767,7 +3779,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
             }
         }
         final File cacheFile = file != null ? file : FileLoader.getInstance(messageObject.currentAccount).getPathToMessage(messageObject.messageOwner);
-        boolean canStream = SharedConfig.streamMedia && (messageObject.isMusic() || messageObject.isRoundVideo() || messageObject.isVideo() && (audioOnly || messageObject.canStreamVideo())) && !messageObject.shouldEncryptPhotoOrVideo() && !DialogObject.isEncryptedDialog(messageObject.getDialogId());
+        boolean canStream = SharedConfig.streamMedia && (messageObject.isMusic() || messageObject.isRoundVideo() || audioOnly || messageObject.isVideo() && messageObject.canStreamVideo()) && !messageObject.shouldEncryptPhotoOrVideo() && !DialogObject.isEncryptedDialog(messageObject.getDialogId());
         if (cacheFile != file && !(exists = cacheFile.exists()) && !canStream) {
             FileLoader.getInstance(messageObject.currentAccount).loadFile(messageObject.getDocument(), messageObject, FileLoader.PRIORITY_LOW, messageObject.shouldEncryptPhotoOrVideo() ? 2 : 0);
             downloadingCurrentMessage = true;
